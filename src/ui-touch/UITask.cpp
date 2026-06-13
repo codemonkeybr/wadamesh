@@ -6097,6 +6097,19 @@ static void wifiScanService() {
   wifiScanFillList();   // no-op if the popup was closed
 }
 
+// Live Wi-Fi radio toggle on the Wi-Fi settings page (mirrors the control-center
+// toggle). wifiConfigSetRadioEnabled persists the pref + flags an apply, so the
+// main loop brings esp_wifi up / down on the spot — no Save needed, no reboot.
+static void wifiRadioToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  wifiConfigSetRadioEnabled(on);
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("Wi-Fi on") : TR("Wi-Fi off"), 800);
+  refreshStatusLabels();
+#endif
+}
+
 static void buildWifiSettings() {
   lv_obj_t* body = createSettingsModal("Wi-Fi", SettingsModalKind::Wifi);
   int y = 0;
@@ -6112,6 +6125,7 @@ static void buildWifiSettings() {
   g_set_modal.wifi_sw = lv_switch_create(body);
   lv_obj_align(g_set_modal.wifi_sw, LV_ALIGN_TOP_RIGHT, 0, y);   // toggle next to "Status"
   if (wifiConfigGetRadioEnabled()) lv_obj_add_state(g_set_modal.wifi_sw, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(g_set_modal.wifi_sw, wifiRadioToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);  // live on/off — no Save needed
   y += 30;
 
   g_set_modal.wifi_sta_status_l = lv_label_create(body);
