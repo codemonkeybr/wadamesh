@@ -37,7 +37,10 @@
   .kicker{display:inline-block; margin-bottom:24px; padding:6px 13px; border:1px solid var(--line);
     border-radius:100px; color:var(--mut); font-size:.78rem; letter-spacing:.05em; text-transform:uppercase;
     font-family:'JetBrains Mono',monospace; background:#fff}
-  .logo{width:min(440px,82vw); height:auto; display:block; margin:0 auto}
+  .brand{display:flex; align-items:center; justify-content:center; gap:clamp(12px,2.6vw,20px); flex-wrap:wrap}
+  .brand .mark{width:clamp(60px,13vw,88px); height:auto; flex:none}
+  .brand .word{font-weight:700; font-size:clamp(2rem,7.5vw,3.35rem); letter-spacing:3px; color:var(--ink); line-height:1}
+  .brand .word .t{color:var(--teal)}
   .lede{max-width:600px; margin:26px auto 0; color:var(--ink); font-size:clamp(1.1rem,2.5vw,1.5rem); font-weight:600}
   .sub{max-width:560px; margin:12px auto 0; color:var(--mut); font-size:1rem}
   .sub b{color:var(--ink)}
@@ -113,19 +116,15 @@
 <header>
   <div class="wrap">
     <span class="kicker">open source · GPL-3.0</span>
-    <!-- wadamesh dark-ink lockup -->
-    <svg class="logo" viewBox="0 0 720 140" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="wadamesh">
-      <g transform="translate(0 10)">
-        <path d="M10 60 L50 108 L90 60 L130 108 L170 60" stroke="#15181E" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
-        <path d="M10 60 L50 12 L90 60 L130 12 L170 60" stroke="#15181E" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
-        <g fill="#15B6A6">
-          <circle cx="10" cy="60" r="7.5"/><circle cx="90" cy="60" r="7.5"/><circle cx="170" cy="60" r="7.5"/>
-          <circle cx="50" cy="12" r="7.5"/><circle cx="130" cy="12" r="7.5"/>
-          <circle cx="50" cy="108" r="7.5"/><circle cx="130" cy="108" r="7.5"/>
-        </g>
-      </g>
-      <text x="225" y="92" font-family="'JetBrains Mono','Courier New',monospace" font-weight="700" font-size="62" letter-spacing="6" fill="#15181E">WADA<tspan fill="#15B6A6">MESH</tspan></text>
-    </svg>
+    <!-- wadamesh brand: mark + wordmark, flex-centered -->
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 180 120" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="wadamesh">
+        <path d="M10 60 L50 108 L90 60 L130 108 L170 60" stroke="#15181E" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M10 60 L50 12 L90 60 L130 12 L170 60" stroke="#15181E" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+        <g fill="#15B6A6"><circle cx="10" cy="60" r="7"/><circle cx="90" cy="60" r="7"/><circle cx="170" cy="60" r="7"/><circle cx="50" cy="12" r="7"/><circle cx="130" cy="12" r="7"/><circle cx="50" cy="108" r="7"/><circle cx="130" cy="108" r="7"/></g>
+      </svg>
+      <span class="word mono">WADA<span class="t">MESH</span></span>
+    </div>
     <p class="lede">A real touchscreen UI for your mesh radio.</p>
     <p class="sub">MeshCore firmware for the <b>LilyGo&nbsp;T-Deck</b> and <b>Heltec&nbsp;V4</b> — map, chat, channels and contacts, on the device itself.</p>
     <div class="pills">
