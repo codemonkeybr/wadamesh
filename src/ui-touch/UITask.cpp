@@ -15224,7 +15224,7 @@ static void openMessageInfoPopup(int msg_idx) {
   //   SNR    -3.5 dB             (or "—")
   //   RSSI   -101 dBm            (or "—")
   //   Status sent / delivered / failed   (only when outgoing DM)
-  char body[600];   // extra headroom for per-hop recolor markers (#RRGGBB ... #)
+  char body[1400];  // headroom for the FULL per-hop route list + recolor markers (#RRGGBB ... #)
   int blen = 0;
   // Title is rendered as a separate label below — don't repeat it in body.
   // Time
@@ -15259,31 +15259,30 @@ static void openMessageInfoPopup(int msg_idx) {
       blen += snprintf(body + blen, sizeof(body) - blen, "\nScope  %04X", (unsigned)m.in_scope);
     }
     // Full inbound route — the repeaters this flood traversed. Resolve each hop's
-    // hash to its repeater name when that contact is known (else show the bare
-    // hash). Hard-bounded + hop-capped so it can never overflow body[] or grow
-    // past the card; the name lookup is read-only so it's safe mid-RX.
+    // hash to its repeater name when that contact is known. EVERY hop is listed
+    // (the popup body scrolls); a hard buffer guard is the only bound. When a hop
+    // resolves to a name we show just the name — appending the raw hash hex made
+    // long names wrap so the trailing hash ran into the next hop's number
+    // ("…Toenis 31" + "3." read as "313."). The hash is only shown as a fallback
+    // when the name is unknown. The name lookup is read-only so it's safe mid-RX.
     if (is_flood && m.in_path_n > 0) {
       const uint8_t hsz = (uint8_t)((m.path_len >> 6) + 1);
       const uint8_t cnt = (uint8_t)(m.path_len & 0x3F);
       blen += snprintf(body + blen, sizeof(body) - blen, "\nRoute");
-      const int kMaxHops = 6;                          // keep inside the card; "+N more" past this
       int off = 0;
       for (uint8_t h = 0; h < cnt && off + (int)hsz <= m.in_path_n; ++h, off += hsz) {
         if (blen >= (int)sizeof(body) - 56) break;     // hard guard: never overflow body[]
-        if (h >= kMaxHops) {
-          blen += snprintf(body + blen, sizeof(body) - blen, "\n  ... +%u more", (unsigned)(cnt - h));
-          break;
-        }
-        char hashstr[9] = {0};
-        for (uint8_t b = 0; b < hsz && b < 4; ++b)
-          snprintf(hashstr + b * 2, sizeof(hashstr) - b * 2, "%02X", m.in_path[off + b]);
         char nm[33];   // ContactInfo.name is 32B; hold the full name (emoji eat 4B each)
-        if (the_mesh.uiHopName(&m.in_path[off], hsz, nm, sizeof(nm)))
-          blen += snprintf(body + blen, sizeof(body) - blen, "\n %u. #%06X %s  %s#",
-                           (unsigned)(h + 1), (unsigned)nodeSigColorHex(nm), nm, hashstr);
-        else
+        if (the_mesh.uiHopName(&m.in_path[off], hsz, nm, sizeof(nm))) {
+          blen += snprintf(body + blen, sizeof(body) - blen, "\n %u. #%06X %s#",
+                           (unsigned)(h + 1), (unsigned)nodeSigColorHex(nm), nm);
+        } else {
+          char hashstr[9] = {0};
+          for (uint8_t b = 0; b < hsz && b < 4; ++b)
+            snprintf(hashstr + b * 2, sizeof(hashstr) - b * 2, "%02X", m.in_path[off + b]);
           blen += snprintf(body + blen, sizeof(body) - blen, "\n %u. #%06X %s#",
                            (unsigned)(h + 1), (unsigned)nodeSigColorHex(hashstr), hashstr);
+        }
       }
     }
   } else if (!m.outgoing) {
@@ -15321,8 +15320,8 @@ static void openMessageInfoPopup(int msg_idx) {
         snprintf(hashstr + b * 2, sizeof(hashstr) - b * 2, "%02X", hh[b]);
       char nm[33];   // ContactInfo.name is 32B; hold the full name (emoji eat 4B each)
       if (the_mesh.uiHopName(hh, hsz, nm, sizeof(nm)))
-        blen += snprintf(body + blen, sizeof(body) - blen, "\n  #%06X %s  %s#",
-                         (unsigned)nodeSigColorHex(nm), nm, hashstr);
+        blen += snprintf(body + blen, sizeof(body) - blen, "\n  #%06X %s#",
+                         (unsigned)nodeSigColorHex(nm), nm);   // name resolved -> no redundant hash
       else
         blen += snprintf(body + blen, sizeof(body) - blen, "\n  #%06X %s#",
                          (unsigned)nodeSigColorHex(hashstr), hashstr);
