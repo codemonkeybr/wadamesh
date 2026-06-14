@@ -14786,7 +14786,7 @@ static void openMessageInfoPopup(int msg_idx) {
       const int kMaxHops = 6;                          // keep inside the card; "+N more" past this
       int off = 0;
       for (uint8_t h = 0; h < cnt && off + (int)hsz <= m.in_path_n; ++h, off += hsz) {
-        if (blen >= (int)sizeof(body) - 40) break;     // hard guard: never overflow body[]
+        if (blen >= (int)sizeof(body) - 56) break;     // hard guard: never overflow body[]
         if (h >= kMaxHops) {
           blen += snprintf(body + blen, sizeof(body) - blen, "\n  ... +%u more", (unsigned)(cnt - h));
           break;
@@ -14794,7 +14794,7 @@ static void openMessageInfoPopup(int msg_idx) {
         char hashstr[9] = {0};
         for (uint8_t b = 0; b < hsz && b < 4; ++b)
           snprintf(hashstr + b * 2, sizeof(hashstr) - b * 2, "%02X", m.in_path[off + b]);
-        char nm[21];
+        char nm[33];   // ContactInfo.name is 32B; hold the full name (emoji eat 4B each)
         if (the_mesh.uiHopName(&m.in_path[off], hsz, nm, sizeof(nm)))
           blen += snprintf(body + blen, sizeof(body) - blen, "\n %u. %s  %s", (unsigned)(h + 1), nm, hashstr);
         else
@@ -14827,14 +14827,14 @@ static void openMessageInfoPopup(int msg_idx) {
     // Bounded (<= ECHO_MAX_HOPS) + hard buffer guard + read-only lookup -> no risk.
     uint8_t rhc = the_mesh.uiRepeatHopCount(m.sent_fp);
     for (uint8_t r = 0; r < rhc; r++) {
-      if (blen >= (int)sizeof(body) - 40) break;
+      if (blen >= (int)sizeof(body) - 56) break;
       uint8_t hh[4];
       uint8_t hsz = the_mesh.uiRepeatHop(m.sent_fp, r, hh, sizeof(hh));
       if (hsz == 0) continue;
       char hashstr[9] = {0};
       for (uint8_t b = 0; b < hsz && b < 4; ++b)
         snprintf(hashstr + b * 2, sizeof(hashstr) - b * 2, "%02X", hh[b]);
-      char nm[21];
+      char nm[33];   // ContactInfo.name is 32B; hold the full name (emoji eat 4B each)
       if (the_mesh.uiHopName(hh, hsz, nm, sizeof(nm)))
         blen += snprintf(body + blen, sizeof(body) - blen, "\n  %s  %s", nm, hashstr);
       else
