@@ -2478,7 +2478,12 @@ void MyMesh::begin(bool has_display) {
 #ifdef DISPLAY_CLASS
     if (has_display && BLE_PIN_CODE == 123456) {
       StdRNG rng;
-      _active_ble_pin = rng.nextInt(100000, 999999); // random pin each session
+      _active_ble_pin = rng.nextInt(100000, 999999); // random pin, generated ONCE
+      // Persist it so it stays the SAME across reboots — it used to be re-rolled
+      // every boot (ble_pin stayed 0), so a paired phone's saved PIN stopped
+      // matching and pairing broke (user report: "BT pin resets sometimes").
+      _prefs.ble_pin = _active_ble_pin;
+      savePrefs();
     } else {
       _active_ble_pin = BLE_PIN_CODE; // otherwise static pin
     }

@@ -35,7 +35,7 @@ static bool s_begun = false;
 // short read (→ treat as absent → defaults); `ver` lets later builds add fields.
 static const char* KEY_CFG = "cfg";
 static const uint16_t TOUCH_CFG_MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static const uint8_t  TOUCH_CFG_VER   = 2;   // v2 adds sig_probe_en + sig_poll_min
+static const uint8_t  TOUCH_CFG_VER   = 3;   // v2 adds sig_probe_en + sig_poll_min; v3 adds tz_zone
 
 // Defaults (kept identical to the historical per-key defaults).
 static const uint16_t DEFAULT_SCREEN_TIMEOUT_S = 20;
@@ -72,6 +72,7 @@ struct __attribute__((packed)) TouchCfg {
   uint32_t gps_baud;         // "gps_baud"   0 = unset -> caller fallback
   uint8_t  sig_probe_en;     // signal auto-discover probe on/off (bool) — v2
   uint16_t sig_poll_min;     // minutes between signal probes, 1..1440  — v2
+  uint8_t  tz_zone;          // selected time-zone index (0 = Europe/CET)  — v3
 };
 
 static TouchCfg s_cfg;
@@ -120,6 +121,7 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.gps_baud      = 0;          // 0 sentinel -> getter returns caller fallback
   c.sig_probe_en  = DEFAULT_SIG_PROBE_EN;
   c.sig_poll_min  = DEFAULT_SIG_POLL_MIN;
+  c.tz_zone       = 0;          // 0 = Europe (CET/CEST) — preserves prior behaviour
 }
 
 // Persist the whole blob using the same end()/begin(RW)/put/end()/begin(RO)
@@ -154,6 +156,12 @@ static void cfgLoadOrMigrate() {
       // newer trailing fields at their default), then version-upgrade if needed.
       memcpy(&s_cfg, &tmp, n < sizeof(s_cfg) ? n : sizeof(s_cfg));
       if (s_cfg.ver < TOUCH_CFG_VER) {
+        // v2->v3: a manual hour offset used to mean "CET base + offset". Preserve
+        // that under the new zone picker by mapping such users onto the Custom
+        // (UTC-offset) zone, so their clock doesn't jump to CET. 0xFE is resolved
+        // to the real Custom index on the first touchPrefsGetTimezone() call (the
+        // zone count isn't known here). offset 0 stays zone 0 (Europe) = unchanged.
+        if (s_cfg.ver < 3 && s_cfg.time_offs != 0) s_cfg.tz_zone = 0xFE;
         s_cfg.ver = TOUCH_CFG_VER;
         s_cfg.magic = TOUCH_CFG_MAGIC;
         cfgFlush();                // rewrite with new fields defaulted-in
@@ -489,13 +497,70 @@ bool touchPrefsSetTimeOffsetHours(int hours) {
   s_cfg.time_offs = (int8_t)hours;
   return cfgFlush();
 }
+// Curated time zones, each with the correct POSIX DST rules for that region, so
+// non-European users get the right time year-round instead of the CET base + EU
+// DST dates. Index 0 (Europe/CET) is the default and matches the old behaviour.
+struct TzZone { const char* label; const char* posix; };
+static const TzZone TZ_ZONES[] = {
+  { "Europe (CET/CEST)",   "CET-1CEST,M3.5.0,M10.5.0/3" },
+  { "UK (GMT/BST)",        "GMT0BST,M3.5.0/1,M10.5.0" },
+  { "UTC",                 "UTC0" },
+  { "US Eastern",          "EST5EDT,M3.2.0,M11.1.0" },
+  { "US Central",          "CST6CDT,M3.2.0,M11.1.0" },
+  { "US Mountain",         "MST7MDT,M3.2.0,M11.1.0" },
+  { "US Arizona (no DST)", "MST7" },
+  { "US Pacific",          "PST8PDT,M3.2.0,M11.1.0" },
+  { "US Alaska",           "AKST9AKDT,M3.2.0,M11.1.0" },
+  { "US Hawaii",           "HST10" },
+  { "Canada Atlantic",     "AST4ADT,M3.2.0,M11.1.0" },
+  { "Brazil (Brasilia)",   "<-03>3" },
+  { "India (IST)",         "IST-5:30" },
+  { "China (CST)",         "CST-8" },
+  { "Japan (JST)",         "JST-9" },
+  { "Sydney (AEST/AEDT)",  "AEST-10AEDT,M10.1.0,M4.1.0/3" },
+};
+static const int TZ_ZONE_N = (int)(sizeof(TZ_ZONES) / sizeof(TZ_ZONES[0]));
+
+int touchPrefsTimezoneCount() { return TZ_ZONE_N + 1; }   // +1 = "Custom (UTC offset)"
+
+const char* touchPrefsTimezoneLabel(int idx) {
+  if (idx >= 0 && idx < TZ_ZONE_N) return TZ_ZONES[idx].label;
+  if (idx == TZ_ZONE_N)            return "Custom (UTC offset)";
+  return "";
+}
+
+uint8_t touchPrefsGetTimezone() {
+  if (!s_begun) touchPrefsBegin();
+  uint8_t z = s_cfg.tz_zone;
+  if (z == 0xFE) {   // v2->v3 migration sentinel: had a manual offset -> Custom zone
+    z = (uint8_t)(touchPrefsTimezoneCount() - 1);
+    s_cfg.tz_zone = z;
+    cfgFlush();
+  }
+  if (z >= (uint8_t)touchPrefsTimezoneCount()) z = 0;   // stale/garbage -> default
+  return z;
+}
+
+void touchPrefsSetTimezone(uint8_t idx) {
+  if (!s_begun) touchPrefsBegin();
+  if (idx >= (uint8_t)touchPrefsTimezoneCount()) idx = 0;
+  s_cfg.tz_zone = idx;
+  cfgFlush();
+}
+
 void touchPrefsBuildLocalTz(char* out, int out_cap) {
   if (!out || out_cap <= 0) return;
-  // CET base is UTC+1 (POSIX std offset -1). The displayed local time is
-  // UTC + (1 + userOffset), so the POSIX std-offset field is -(1 + userOffset).
-  // CEST (summer) auto-adds 1h via the DST rule. offset 0 == "CET-1CEST,...".
-  int off = touchPrefsGetTimeOffsetHours();
-  snprintf(out, out_cap, "CET%dCEST,M3.5.0,M10.5.0/3", -(1 + off));
+  const uint8_t z = touchPrefsGetTimezone();
+  if (z < (uint8_t)TZ_ZONE_N) {
+    snprintf(out, out_cap, "%s", TZ_ZONES[z].posix);
+    return;
+  }
+  // "Custom (UTC offset)": a fixed offset, no DST. POSIX std-offset is the
+  // negation of the UTC offset (it's the time to ADD to local to reach UTC), so
+  // UTC-7 -> "<-07>7", UTC+2 -> "<+02>-2".
+  const int off = touchPrefsGetTimeOffsetHours();
+  if (off == 0) { snprintf(out, out_cap, "UTC0"); return; }
+  snprintf(out, out_cap, "<%+03d>%d", off, -off);
 }
 
 uint32_t touchPrefsGetLockTextColor() {
@@ -883,6 +948,67 @@ bool touchPrefsSetIgnored(const uint8_t* pub_key6, bool ignored) {
   }
 }
 
+// Ignored / blocked sender NAMES (channel/room senders that aren't contacts) ---
+// One NVS blob "ign_nm" of up to TOUCH_IGNORED_NAMES_MAX fixed-width,
+// NUL-padded TOUCH_IGNORED_NAME_LEN slots. Same read/replace/write scheme as
+// the 6-byte prefix list above.
+static const char* KEY_IGN_NAMES = "ign_nm";
+
+static int ignNamesReadAll(char out[TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN]) {
+  if (!s_begun) touchPrefsBegin();
+  if (!s_prefs.isKey(KEY_IGN_NAMES)) return 0;   // absent on a fresh device — skip [E] NOT_FOUND
+  size_t n = s_prefs.getBytes(KEY_IGN_NAMES, out, TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN);
+  if (n == 0 || n > (size_t)(TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN)) return 0;
+  return (int)(n / TOUCH_IGNORED_NAME_LEN);
+}
+
+static bool ignNamesWriteAll(const char* buf, int count) {
+  s_prefs.end();
+  if (!s_prefs.begin(TOUCH_NS, false)) return false;
+  bool ok;
+  if (count <= 0) { s_prefs.remove(KEY_IGN_NAMES); ok = true; }
+  else ok = s_prefs.putBytes(KEY_IGN_NAMES, buf, (size_t)(count * TOUCH_IGNORED_NAME_LEN)) > 0;
+  s_prefs.end();
+  s_begun = s_prefs.begin(TOUCH_NS, true);
+  return ok;
+}
+
+bool touchPrefsIsNameIgnored(const char* name) {
+  if (!name || !name[0]) return false;
+  char buf[TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN];
+  int n = ignNamesReadAll(buf);
+  for (int i = 0; i < n; ++i)
+    if (strncmp(&buf[i * TOUCH_IGNORED_NAME_LEN], name, TOUCH_IGNORED_NAME_LEN) == 0) return true;
+  return false;
+}
+
+int touchPrefsCopyIgnoredNames(char* out_buf) {
+  if (!out_buf) return 0;
+  return ignNamesReadAll(out_buf);
+}
+
+bool touchPrefsSetNameIgnored(const char* name, bool ignored) {
+  if (!name || !name[0]) return false;
+  char buf[TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN];
+  int n = ignNamesReadAll(buf);
+  int found = -1;
+  for (int i = 0; i < n; ++i)
+    if (strncmp(&buf[i * TOUCH_IGNORED_NAME_LEN], name, TOUCH_IGNORED_NAME_LEN) == 0) { found = i; break; }
+  if (ignored) {
+    if (found >= 0) return true;
+    if (n >= TOUCH_IGNORED_NAMES_MAX) return false;   // cap reached, silently refuse
+    char* slot = &buf[n * TOUCH_IGNORED_NAME_LEN];
+    memset(slot, 0, TOUCH_IGNORED_NAME_LEN);
+    strncpy(slot, name, TOUCH_IGNORED_NAME_LEN - 1);
+    ++n; ignNamesWriteAll(buf, n); return true;
+  } else {
+    if (found < 0) return false;
+    for (int i = found; i < n - 1; ++i)
+      memcpy(&buf[i * TOUCH_IGNORED_NAME_LEN], &buf[(i + 1) * TOUCH_IGNORED_NAME_LEN], TOUCH_IGNORED_NAME_LEN);
+    --n; ignNamesWriteAll(buf, n); return false;
+  }
+}
+
 // Notification-sound prefs (individual NVS keys — integer getters don't emit the
 // [E] NOT_FOUND log that getString/getBytes do on a fresh device) -----------
 static void prefsPutUChar(const char* key, uint8_t v) {
@@ -912,6 +1038,14 @@ uint8_t touchPrefsGetDiscoveredMaxHops() {
   return s_prefs.getUChar("dsc_hops", 0);   // 0 = off
 }
 void touchPrefsSetDiscoveredMaxHops(uint8_t hops) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("dsc_hops", hops); }
+bool touchPrefsGetEnterSends()      { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("ent_send", 1) != 0; }
+void touchPrefsSetEnterSends(bool on)      { if (!s_begun) touchPrefsBegin(); prefsPutUChar("ent_send", on ? 1 : 0); }
+bool touchPrefsGetClock12h()        { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("clk_12h", 0) != 0; }
+void touchPrefsSetClock12h(bool on)        { if (!s_begun) touchPrefsBegin(); prefsPutUChar("clk_12h", on ? 1 : 0); }
+bool touchPrefsGetScrollReverse()   { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("tb_rev", 0) != 0; }
+void touchPrefsSetScrollReverse(bool on)   { if (!s_begun) touchPrefsBegin(); prefsPutUChar("tb_rev", on ? 1 : 0); }
+bool touchPrefsGetLockOnScreenOff() { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("lock_off", 0) != 0; }
+void touchPrefsSetLockOnScreenOff(bool on) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("lock_off", on ? 1 : 0); }
 
 // Generic blob (used to persist the discovered-nodes list across reboots).
 size_t touchPrefsGetBlob(const char* key, uint8_t* out, size_t maxlen) {

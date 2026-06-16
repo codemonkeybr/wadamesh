@@ -401,6 +401,10 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);
     WiFi.persistent(false);
+    // NOTE: do NOT enable modem-sleep here. On a fresh, *unassociated* STA (the
+    // setup wizard, no creds yet) DTIM modem-sleep naps the radio through the
+    // scan dwell, so WiFi.scanNetworks() comes back empty ("no networks found").
+    // It's enabled once we actually associate — see the GOT_IP handler below.
   }
 #if defined(BLE_PIN_CODE)
   /* Always stash the BLE params so the toggle can bring BLE up live later, even
@@ -563,6 +567,12 @@ void loop() {
     static bool sntp_pushed = false;
     static uint32_t sntp_kick_ms = 0;
     if (WiFi.status() == WL_CONNECTED) {
+      // Now that we're associated, enable DTIM modem-sleep (saves power + gives
+      // BLE coexistence airtime). Deferred to here on purpose: enabling it on the
+      // unassociated STA naps the radio through a scan dwell and breaks the setup
+      // wizard's WiFi.scanNetworks() ("no networks found"). One-shot.
+      static bool modem_sleep_set = false;
+      if (!modem_sleep_set) { WiFi.setSleep(true); modem_sleep_set = true; }
       if (!sntp_kicked) {
         /* Brussels timezone with DST rules baked in (POSIX "CET-1CEST,...").
          * On touch builds the base is shifted by the user's manual hour offset
@@ -605,6 +615,32 @@ void loop() {
 #endif
   the_mesh.loop();
   sensors.loop();
+#if defined(ESP32)
+  // GPS time guard (Ricky Leong's "stuck at 1902"): MicroNMEALocationProvider
+  // sets the mesh RTC from a GPS *position* fix even before the date fields are
+  // valid (getYear()==0 -> ~1902-10-11), and re-syncs every 30 min — so it
+  // periodically clobbers a good time. A 1902 clock stamps our adverts as
+  // decades old and every other node rejects them as stale.
+  //
+  // On the T-Deck the mesh RTC, NTP and GPS ALL share the one ESP32 system clock
+  // (ESP32RTCClock == settimeofday/gettimeofday), so we can't recover by
+  // "re-reading NTP" — it was already overwritten. Instead keep a millis()-
+  // anchored copy of the last good time and rebuild from it whenever the clock
+  // reads garbage, undoing the clobber before the next the_mesh.loop() sends an
+  // advert. The anchor refreshes every loop while the clock is sane, so the
+  // rebuilt time is accurate to the second.
+  {
+    static uint32_t good_epoch = 0, good_millis = 0;
+    const uint32_t live = rtc_clock.getCurrentTime();
+    if (live > 1700000000UL) {                 // clock sane -> remember it (anchor)
+      good_epoch  = live;
+      good_millis = millis();
+    } else if (good_epoch != 0) {              // clock went bad -> rebuild from anchor
+      const uint32_t rebuilt = good_epoch + (uint32_t)((millis() - good_millis) / 1000UL);
+      rtc_clock.setCurrentTime(rebuilt);
+    }
+  }
+#endif
   rtc_clock.tick();
 
   // (1.16) sleep when there's no pending work — nRF power saving

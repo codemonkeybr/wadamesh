@@ -156,6 +156,20 @@ bool touchPrefsIsIgnored(const uint8_t* pub_key6);
 bool touchPrefsSetIgnored(const uint8_t* pub_key6, bool ignored);
 int  touchPrefsCopyIgnored(uint8_t* out_buf);
 
+/** Ignored / blocked sender NAMES — for channel/room senders who are NOT saved
+ *  contacts, so the 6-byte pubkey scheme above can't target them (e.g. a bot
+ *  posting inside a joined room: posts carry only a display name, not a pubkey).
+ *  Incoming channel/room messages whose parsed sender name is stored here are
+ *  dropped (no bubble, no notification, no sound). Case-sensitive exact match.
+ *  • touchPrefsIsNameIgnored / touchPrefsSetNameIgnored: membership + add/remove.
+ *  • touchPrefsCopyIgnoredNames: copy every stored name into `out_buf`
+ *    (>= TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN bytes); returns count. */
+constexpr int TOUCH_IGNORED_NAMES_MAX = 16;
+constexpr int TOUCH_IGNORED_NAME_LEN  = 28;   // fixed NUL-padded slot (>= MAX_SENDER_NAME+1)
+bool touchPrefsIsNameIgnored(const char* name);
+bool touchPrefsSetNameIgnored(const char* name, bool ignored);
+int  touchPrefsCopyIgnoredNames(char* out_buf);
+
 /** Notification-sound prefs (the message chime itself stays on the core
  *  buzzer_quiet flag). @-mention chime is a SEPARATE enable + a distinct sound,
  *  so an operator can mute everything but still hear @-mentions. Volume is the
@@ -170,6 +184,14 @@ bool    touchPrefsGetSoundMentions();          // default true
 void    touchPrefsSetSoundMentions(bool on);
 uint8_t touchPrefsGetSoundVolume();            // 0..100, default 70
 void    touchPrefsSetSoundVolume(uint8_t vol);
+bool    touchPrefsGetEnterSends();             // Enter key sends a chat message (default true)
+void    touchPrefsSetEnterSends(bool on);
+bool    touchPrefsGetClock12h();               // 12-hour clock (default false = 24h)
+void    touchPrefsSetClock12h(bool on);
+bool    touchPrefsGetScrollReverse();          // invert trackball/scrollball direction (default false)
+void    touchPrefsSetScrollReverse(bool on);
+bool    touchPrefsGetLockOnScreenOff();        // idle screen-off auto-locks; only a deliberate hold wakes (default false)
+void    touchPrefsSetLockOnScreenOff(bool on);
 
 /** Per-channel mute, keyed by channel name. Bit 0 = mute messages, bit 1 =
  *  mute @-mentions. Suppresses the notification SOUND for that channel (the
@@ -252,9 +274,20 @@ bool     touchPrefsSetAccentColor(uint32_t rgb);
 int  touchPrefsGetTimeOffsetHours();
 bool touchPrefsSetTimeOffsetHours(int hours);
 
-/** Build the POSIX TZ string for local-time display: the CET/CEST base plus the
- *  user's hour offset (see touchPrefsGetTimeOffsetHours). Used by both the
- *  boot-time setenv and the Wi-Fi NTP sync so the offset is honoured everywhere.
+/** Time-zone picker. A curated list of named zones, each carrying the correct
+ *  POSIX TZ string WITH that region's DST rules — so non-European users get the
+ *  right time year-round instead of being stuck on the CET base + EU DST dates.
+ *  Default 0 == "Europe (CET/CEST)" (unchanged behaviour). The LAST index is
+ *  "Custom (UTC offset)", which uses touchPrefsGetTimeOffsetHours() as a fixed,
+ *  no-DST offset. touchPrefsBuildLocalTz() resolves the selected zone. */
+int         touchPrefsTimezoneCount();           // number of pickable entries
+const char* touchPrefsTimezoneLabel(int idx);    // display label for the picker
+uint8_t     touchPrefsGetTimezone();             // selected index (default 0)
+void        touchPrefsSetTimezone(uint8_t idx);
+
+/** Build the POSIX TZ string for local-time display from the selected time zone
+ *  (touchPrefsGetTimezone), or a fixed UTC offset for the "Custom" entry. Used by
+ *  both the boot-time setenv and the Wi-Fi NTP sync so it's honoured everywhere.
  *  `out` is always null-terminated when out_cap > 0. */
 void touchPrefsBuildLocalTz(char* out, int out_cap);
 

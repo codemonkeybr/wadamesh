@@ -709,6 +709,7 @@ constexpr bool k_show_live_diag_overlay = false;
 static lv_obj_t*     s_tb_cursor = nullptr;
 static int           s_tb_cursor_x = 160;   // rendered position (landscape 320x240)
 static int           s_tb_cursor_y = 120;
+static bool          s_tb_reverse  = false;  // invert trackball direction (cached pref; refreshed at init + on toggle)
 static float         s_tb_target_x = 160.0f, s_tb_target_y = 120.0f;  // full-sensitivity target
 static float         s_tb_render_x = 160.0f, s_tb_render_y = 120.0f;  // eased render position
 static unsigned long s_tb_prev_ms = 0;
@@ -1391,6 +1392,7 @@ static void applyHardwarePanelRotation(uint8_t lvgl_rot) {
 
 static unsigned long s_slider_touch_ms = 0;   // last time a slider (volume, etc.) was dragged
 static bool s_wake_swallow = false;           // swallow the whole touch that wakes the screen (issue #4)
+static bool s_lock_on_screen_off = false;     // idle screen-off also engages the manual lock (cached pref)
 static void lvglTouchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   (void)indev;
   static lv_point_t p = {0, 0};
@@ -1532,6 +1534,7 @@ static void shareMyContactBtnCb(lv_event_t* e);
 static void openShareMyContactPopup();
 static void refreshMapInfoLabel();
 static void renderMapTiles();
+static void renderMapMarkers();
 static void freeMapTiles();
 // Single entry point used by tabChangedCb. Recenters on self GPS and
 // rebuilds the tile grid. Defined alongside the map state below.
@@ -5543,6 +5546,64 @@ static void useMilesToggleCb(lv_event_t* e) {
   refreshContactsList();
 }
 
+// Enter key sends the chat message (default) vs. inserts a newline so you send
+// only via the on-screen button — Tim kept firing messages on the public
+// channel by accident. Physical keyboard only (the on-screen keyboard's
+// checkmark never auto-sent).
+#if defined(HAS_TDECK_KEYBOARD)
+static void enterSendsToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetEnterSends(on);
+#endif
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("Enter sends messages") : TR("Enter adds a new line"), 1200);
+}
+#endif
+
+// 12-hour vs 24-hour clock. Applies on the next time render (status bar, chat
+// rows, message bubbles).
+static void clock12hToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetClock12h(on);
+#endif
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("Clock: 12-hour") : TR("Clock: 24-hour"), 900);
+}
+
+// Hard-lock (not just dim) when the screen idles off, so the touchscreen is
+// inert until a deliberate unlock. Cached in s_lock_on_screen_off so the loop's
+// idle check never hits NVS.
+static void lockOnScreenOffToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetLockOnScreenOff(on);
+#endif
+  s_lock_on_screen_off = on;
+#if defined(HAS_TDECK_GT911)
+  const char* unlock_hint = on ? TR("Locks when screen off\n(hold the trackball to unlock)") : TR("Screen-off just dims");
+#else
+  const char* unlock_hint = on ? TR("Locks when screen off\n(press the button to unlock)") : TR("Screen-off just dims");
+#endif
+  if (g_lv.task) g_lv.task->showAlert(unlock_hint, 1600);
+}
+
+#if defined(HAS_TDECK_TRACKBALL)
+// Invert the scrollball direction everywhere it drives motion (cursor, map pan,
+// emoji selector). Cached in s_tb_reverse so the per-tick poll never hits NVS.
+static void scrollReverseToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetScrollReverse(on);
+#endif
+  s_tb_reverse = on;
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("Scrollball: reversed") : TR("Scrollball: normal"), 900);
+}
+#endif
+
 // Colourful chat bubbles toggle. On enable: the "taste the rainbow" easter egg.
 // Bubbles recolour the next time a chat opens (this control lives on Settings).
 static void colorfulBubblesToggleCb(lv_event_t* e) {
@@ -5660,6 +5721,81 @@ static void timeOffsetStep(int delta) {
 }
 static void timeOffsetMinusCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) timeOffsetStep(-1); }
 static void timeOffsetPlusCb(lv_event_t* e)  { if (lv_event_get_code(e) == LV_EVENT_CLICKED) timeOffsetStep(+1); }
+
+// ---- Time-zone picker (Device modal) ----------------------------------------
+// A curated list of zones, each with the correct DST rules, so non-EU users get
+// the right time year-round instead of the CET base + EU DST dates. The last
+// entry ("Custom (UTC offset)") uses the +/- hour offset above.
+static lv_obj_t* s_tz_btn_lbl = nullptr;   // Device-modal button caption (current zone)
+static lv_obj_t* s_tz_picker  = nullptr;   // picker overlay (singleton)
+
+static void tzBtnLabelRefresh() {
+  if (s_tz_btn_lbl) lv_label_set_text(s_tz_btn_lbl, touchPrefsTimezoneLabel(touchPrefsGetTimezone()));
+}
+static void tzPickerClose() { if (s_tz_picker) { lv_obj_del_async(s_tz_picker); s_tz_picker = nullptr; } }
+static void tzPickerCloseCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) tzPickerClose(); }
+static void tzPickerSelectCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  touchPrefsSetTimezone((uint8_t)idx);
+  applyTimeOffsetNow();          // rebuild the POSIX TZ from the new zone + tzset()
+  tzBtnLabelRefresh();
+  tzPickerClose();
+  if (g_lv.task) {
+    char m[48]; snprintf(m, sizeof m, TR("Time zone: %s"), touchPrefsTimezoneLabel(idx));
+    g_lv.task->showAlert(m, 1100);
+  }
+}
+static void openTimezonePicker() {
+  tzPickerClose();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_tz_picker = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_tz_picker);
+  lv_obj_set_size(s_tz_picker, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_tz_picker, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_tz_picker, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_tz_picker, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(s_tz_picker, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* title = lv_label_create(s_tz_picker);
+  lv_label_set_text(title, TR("Time zone"));
+  lv_obj_set_style_text_font(title, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(title, 8, 8);
+
+  lv_obj_t* close = lv_btn_create(s_tz_picker);
+  lv_obj_set_size(close, 30, 26);
+  lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
+  styleButton(close);
+  lv_obj_add_event_cb(close, tzPickerCloseCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
+
+  lv_obj_t* list = lv_obj_create(s_tz_picker);
+  lv_obj_remove_style_all(list);
+  lv_obj_set_size(list, sw - 12, sh - STATUSBAR_H - 44);
+  lv_obj_set_pos(list, 6, 40);
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(list, 6, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(list, LV_DIR_VER);
+
+  const int cur = (int)touchPrefsGetTimezone();
+  const int n   = touchPrefsTimezoneCount();
+  for (int i = 0; i < n; ++i) {
+    lv_obj_t* row = lv_btn_create(list);
+    lv_obj_set_size(row, sw - 16, 40);
+    styleButton(row);
+    if (i == cur) lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+    lv_obj_add_event_cb(row, tzPickerSelectCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, touchPrefsTimezoneLabel(i));
+    lv_obj_set_style_text_font(lbl, &g_font_14, LV_PART_MAIN);
+    lv_obj_center(lbl);
+  }
+  lv_obj_move_foreground(s_tz_picker);
+}
+static void openTimezoneCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) openTimezonePicker(); }
 
 #if defined(HAS_TDECK_GT911)
 // Lock-screen settings live in the Device modal but the picker implementation
@@ -5875,6 +6011,18 @@ static void buildDeviceSettings(int sec) {
     y += LV_MAX(40, h + 12);
   }
 
+  /* Clock format: OFF = 24-hour (default), ON = 12-hour AM/PM. */
+  {
+    int h = settingsRowLabel(body, y, 6, "12-hour clock", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetClock12h()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, clock12hToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(40, h + 12);
+  }
+
   /* Colourful chat bubbles: colour every bubble + sender name by a hash of the
      sender's name (same name -> same colour). "Taste the rainbow" on enable. */
   {
@@ -5985,6 +6133,38 @@ static void buildDeviceSettings(int sec) {
                           COLOR_SUB, &g_font_12, 0) + 2;
   }
 
+#if defined(HAS_TDECK_KEYBOARD)
+  /* Enter sends the message (default) vs. inserts a newline so you send only via
+     the on-screen button — avoids accidental sends on the public channel. */
+  {
+    int h = settingsRowLabel(body, y, 4, "Enter key sends message", COLOR_TEXT, &g_font_12, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetEnterSends()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, enterSendsToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(34, h + 10);
+    y += settingsRowLabel(body, y, 0, "off = Enter adds a new line; tap Send to send",
+                          COLOR_SUB, &g_font_12, 0) + 2;
+  }
+#endif
+
+#if defined(HAS_TDECK_TRACKBALL)
+  /* Reverse scrollball: invert trackball direction (cursor, map pan, emoji
+     selector) for users who expect the opposite roll-to-move mapping. */
+  {
+    int h = settingsRowLabel(body, y, 4, "Reverse scrollball", COLOR_TEXT, &g_font_12, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetScrollReverse()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, scrollReverseToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(34, h + 10);
+  }
+#endif
+
   }
 
   if (sec == DSEC_DISPLAY) {   // --- Orientation (display) ---
@@ -6049,13 +6229,43 @@ static void buildDeviceSettings(int sec) {
   }
 #endif
 
+  /* Auto-lock on screen-off: when the idle timeout dims the screen, also hard-
+     lock so the touchscreen is inert (Tim: pocket-taps while dark). Both boards;
+     unlock with a trackball hold (T-Deck) or the button (V4). */
+  {
+    int h = settingsRowLabel(body, y, 6, "Lock when screen off", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetLockOnScreenOff()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, lockOnScreenOffToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(40, h + 12);
+  }
+
   }
 
   if (sec == DSEC_SYSTEM) {   // --- Time / actions / live info ---
-  /* Time offset: nudge the displayed clock +/- whole hours on top of the
-     automatic (NTP / companion / mesh) time. Display-only. Both boards. */
+  /* Time zone: pick a region with the correct DST rules. Fixes non-EU users who
+     were stuck on the CET base. Applies immediately. Both boards. */
   {
-    y += settingsRowLabel(body, y, 0, "Time offset (vs automatic)", COLOR_SUB, &g_font_12, 0) + 2;
+    y += settingsRowLabel(body, y, 0, "Time zone", COLOR_SUB, &g_font_12, 0) + 2;
+    lv_obj_t* b_tz = lv_btn_create(body);
+    lv_obj_set_size(b_tz, lv_pct(100), 34);
+    lv_obj_set_pos(b_tz, 2, y);
+    styleButton(b_tz);
+    lv_obj_add_event_cb(b_tz, openTimezoneCb, LV_EVENT_CLICKED, nullptr);
+    s_tz_btn_lbl = lv_label_create(b_tz);
+    lv_label_set_text(s_tz_btn_lbl, touchPrefsTimezoneLabel(touchPrefsGetTimezone()));
+    lv_label_set_long_mode(s_tz_btn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_tz_btn_lbl, lv_pct(92));
+    lv_obj_center(s_tz_btn_lbl);
+    y += 42;
+  }
+  /* Time offset: only used when Time zone = "Custom (UTC offset)"; otherwise the
+     selected zone (with its own DST) is authoritative. Display-only. Both boards. */
+  {
+    y += settingsRowLabel(body, y, 0, "Custom UTC offset (hours)", COLOR_SUB, &g_font_12, 0) + 2;
 
     lv_obj_t* bminus = lv_btn_create(body);
     lv_obj_set_size(bminus, 50, 34);
@@ -13993,6 +14203,16 @@ static void renderMapTiles() {
   // offset only exists during a live drag.
   if (s_map_pan_layer) lv_obj_set_pos(s_map_pan_layer, 0, 0);
 
+  // Re-plot the contact markers at the NEW zoom/center BEFORE the tile loop.
+  // Tiles below decode one-by-one with a progressive lv_refr_now() between
+  // them (~2 s for a full 9-tile zoom), and each tile sinks to the background
+  // via lv_obj_move_background — so the dots ride on top from the very first
+  // paint instead of lingering at their stale previous-zoom positions until the
+  // last tile lands (the "dots update ~2 s after the zoom" report). Callers
+  // still invoke renderMapMarkers() afterwards to rebuild links/route overlays;
+  // that trailing pass is now a cheap no-visual-change refresh.
+  renderMapMarkers();
+
   // Pass 1 — keep matching slots, free non-matching ones.
   for (auto& t : s_map_tiles) {
     if (!t.in_use) continue;
@@ -16521,7 +16741,7 @@ static void msgMenuBlockCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   const bool ok = g_lv.task->ignoreSenderInActiveThread(s_msg_menu_sender);
   closeMsgActionMenu();
-  g_lv.task->showAlert(ok ? TR("Sender blocked") : TR("Can't block \xe2\x80\x94 not a contact"), 1500);
+  g_lv.task->showAlert(ok ? TR("Sender blocked") : TR("Block list full"), 1500);
 }
 
 static void openMessageActionMenu(int msg_idx) {
@@ -16928,6 +17148,13 @@ static void usernameBubbleColors(const char* name, lv_color_t* bubble_bg, lv_col
 
 static void refreshChatDetail(LvChatPanel& p) {
   if (!g_lv.task || !p.msgs) return;
+  // Capture the pre-rebuild scroll position so a message arriving while the chat
+  // is open doesn't yank the user away from what they're reading. If they were
+  // at the bottom we keep following new messages (standard chat); if they'd
+  // scrolled up we stay put (the jump-to-latest button returns them). lv_obj_clean
+  // below resets the scroll, so we restore it after the rebuild.
+  const lv_coord_t prev_scroll_y = lv_obj_get_scroll_y(p.msgs);
+  const bool       was_at_bottom = lv_obj_get_scroll_bottom(p.msgs) <= 8;
   lv_obj_clean(p.msgs);
 
   if (!g_lv.task->hasActiveThread() ||
@@ -17167,8 +17394,10 @@ static void refreshChatDetail(LvChatPanel& p) {
   }
 
   // On open with unread, land on the "new messages" divider (Discord-style)
-  // instead of the bottom; otherwise show the newest message. Subsequent
-  // refreshes (a message arrived while open) keep scrolling to the bottom.
+  // instead of the bottom; otherwise show the newest message. On a refresh while
+  // already open, follow new messages ONLY if the user was at the bottom — if
+  // they'd scrolled up to read history, stay where they were (don't yank them
+  // down). The jump-to-latest button is there to return to the bottom.
   lv_obj_update_layout(p.msgs);
   if (s_chat_just_opened && jump_y >= 0) {
     // Tapped an @mention: land on that exact message (a little context above it).
@@ -17177,8 +17406,10 @@ static void refreshChatDetail(LvChatPanel& p) {
   } else if (s_chat_just_opened && divider_y >= 0) {
     lv_coord_t target = (divider_y > 8) ? (divider_y - 8) : 0;
     lv_obj_scroll_to_y(p.msgs, target, LV_ANIM_OFF);
-  } else {
+  } else if (s_chat_just_opened || was_at_bottom) {
     lv_obj_scroll_to_y(p.msgs, LV_COORD_MAX, LV_ANIM_OFF);
+  } else {
+    lv_obj_scroll_to_y(p.msgs, prev_scroll_y, LV_ANIM_OFF);   // preserve reading position
   }
   s_chat_just_opened  = false;
   s_chat_jump_msg_idx = -1;   // one-shot: consume the jump target so later refreshes go to the bottom
@@ -17188,19 +17419,37 @@ static void refreshChatDetail(LvChatPanel& p) {
   }
 }
 
+// Format hour:minute honoring the 12/24-hour clock preference. 12h drops the
+// leading zero and appends AM/PM ("2:05 PM"); 24h is plain "%H:%M". Needs a
+// buffer of at least 9 bytes for the 12h form.
+static void fmtClockHM(char* buf, size_t cap, const struct tm* t) {
+  if (!buf || cap < 1) return;
+#if defined(ESP32)
+  if (touchPrefsGetClock12h()) {
+    int h = t->tm_hour % 12; if (h == 0) h = 12;
+    snprintf(buf, cap, "%d:%02d %s", h, t->tm_min, t->tm_hour < 12 ? "AM" : "PM");
+    return;
+  }
+#endif
+  strftime(buf, cap, "%H:%M", t);
+}
+
 // Rebuild the thread list inside a tab.
 // Compact last-message time for a chat-list row: HH:MM today, "DD Mon" earlier
 // this year, "DD/MM/YY" older. Empty when there's no timestamp (ts == 0).
 static void formatChatRowTime(char* buf, size_t cap, uint32_t ts) {
   if (!buf || cap < 1) return;
   buf[0] = '\0';
-  if (ts == 0) return;
+  // Blank for "no real timestamp": 0 (empty/imported channel with no messages),
+  // or a pre-2020 value left by an unsynced/garbage RTC — showing a bogus
+  // 1969/1970/1902 date is worse than showing nothing (Ricky Leong).
+  if (ts < 1577836800UL) return;   // 2020-01-01 UTC
   time_t t = (time_t)ts;
   time_t now = time(nullptr);
   struct tm tmv, tmn;
   localtime_r(&t, &tmv);
   localtime_r(&now, &tmn);
-  if (tmv.tm_year == tmn.tm_year && tmv.tm_yday == tmn.tm_yday) strftime(buf, cap, "%H:%M", &tmv);
+  if (tmv.tm_year == tmn.tm_year && tmv.tm_yday == tmn.tm_yday) fmtClockHM(buf, cap, &tmv);
   else if (tmv.tm_year == tmn.tm_year)                         strftime(buf, cap, "%d %b", &tmv);
   else                                                         strftime(buf, cap, "%d/%m/%y", &tmv);
 }
@@ -17848,6 +18097,7 @@ static void updateTrackball(unsigned long now) {
 
   int dx = 0, dy = 0;
   const bool moved = tdeckTrackballReadMotion(&dx, &dy);
+  if (s_tb_reverse) { dx = -dx; dy = -dy; }   // user opted to invert scrollball direction
 
   // ---- Emoji picker selector mode ----
   // While the emoji sheet is open the trackball drives a grid highlight instead
@@ -19014,8 +19264,16 @@ static void handleHwKey(int key) {
     } else
 #endif
     if (s_kb_panel) {
-      // Chat composer: send and keep the composer focused for the next message.
       LvChatPanel* p = s_kb_panel;
+#if defined(ESP32)
+      // Enter-to-send can be disabled (Tim: avoid accidental sends on the public
+      // channel). When off, Enter just adds a newline so you compose multi-line
+      // and send only via the on-screen button.
+      if (!touchPrefsGetEnterSends()) {
+        if (p->composer_ta) lv_textarea_add_char(p->composer_ta, '\n');
+      } else
+#endif
+      // Chat composer: send and keep the composer focused for the next message.
       if (g_lv.task && p->composer_ta) {
         const char* text = lv_textarea_get_text(p->composer_ta);
         if (text && text[0]) {
@@ -19717,12 +19975,12 @@ static void openControlCenter() {
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
   // ---- Clock + date (left) ----
-  char clock_s[8] = "--:--", date_s[28] = "RTC unset";
+  char clock_s[12] = "--:--", date_s[28] = "RTC unset";
 #if defined(ESP32)
   time_t now_t = time(nullptr);
   if (now_t > 1700000000) {
     struct tm tm_loc; localtime_r(&now_t, &tm_loc);
-    strftime(clock_s, sizeof clock_s, "%H:%M", &tm_loc);
+    fmtClockHM(clock_s, sizeof clock_s, &tm_loc);
     strftime(date_s, sizeof date_s, "%a %d %b %Y", &tm_loc);
   }
 #endif
@@ -20103,7 +20361,7 @@ static void openMentionsScreen() {
     char when[16] = {0};
     if (m.ts > 1700000000UL) {
       time_t tt = (time_t)m.ts; struct tm tmv; localtime_r(&tt, &tmv);
-      strftime(when, sizeof when, "%H:%M", &tmv);
+      fmtClockHM(when, sizeof when, &tmv);
     }
     if (when[0]) {
       lv_obj_t* tl = lv_label_create(row);
@@ -21566,6 +21824,7 @@ static void chanScopeSaveCb(lv_event_t* e) {
 // ---- Blocked-users (ignore-list) manager ----------------------------------
 static lv_obj_t* s_blocked_modal = nullptr;
 static uint8_t   s_blocked_snap[TOUCH_IGNORED_MAX * TOUCH_IGNORE_KEY_BYTES];
+static char      s_blocked_names_snap[TOUCH_IGNORED_NAMES_MAX * TOUCH_IGNORED_NAME_LEN];
 static void blockedModalClose() { if (s_blocked_modal) { lv_obj_del(s_blocked_modal); s_blocked_modal = nullptr; } }
 static void blockedModalCloseCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) blockedModalClose(); }
 static void blockedUnblockCb(lv_event_t* e) {
@@ -21573,6 +21832,13 @@ static void blockedUnblockCb(lv_event_t* e) {
   const int idx = (int)(intptr_t)lv_event_get_user_data(e);
   if (idx < 0 || idx >= TOUCH_IGNORED_MAX) return;
   touchPrefsSetIgnored(&s_blocked_snap[idx * TOUCH_IGNORE_KEY_BYTES], false);
+  openBlockedUsersModal();   // rebuild the list
+}
+static void blockedUnblockNameCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= TOUCH_IGNORED_NAMES_MAX) return;
+  touchPrefsSetNameIgnored(&s_blocked_names_snap[idx * TOUCH_IGNORED_NAME_LEN], false);
   openBlockedUsersModal();   // rebuild the list
 }
 static void openBlockedUsersModal() {
@@ -21601,8 +21867,9 @@ static void openBlockedUsersModal() {
   lv_obj_t* cl = lv_label_create(close); lv_label_set_text(cl, LV_SYMBOL_CLOSE);
   lv_obj_set_style_text_font(cl, &g_font_12, LV_PART_MAIN); lv_obj_center(cl);
 
-  const int n = touchPrefsCopyIgnored(s_blocked_snap);
-  if (n <= 0) {
+  const int n  = touchPrefsCopyIgnored(s_blocked_snap);
+  const int nn = touchPrefsCopyIgnoredNames(s_blocked_names_snap);
+  if (n <= 0 && nn <= 0) {
     lv_obj_t* empty = lv_label_create(s_blocked_modal);
     lv_label_set_text(empty, TR("No blocked users.\n\nLong-press a message and tap\nBlock to add one."));
     lv_obj_set_style_text_color(empty, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
@@ -21655,6 +21922,41 @@ static void openBlockedUsersModal() {
     lv_obj_align(unb, LV_ALIGN_RIGHT_MID, -6, 0);
     styleButton(unb);
     lv_obj_add_event_cb(unb, blockedUnblockCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* ul = lv_label_create(unb);
+    lv_label_set_text(ul, TR("Unblock"));
+    lv_obj_set_style_text_font(ul, &g_font_12, LV_PART_MAIN);
+    lv_obj_center(ul);
+  }
+
+  // Name-blocked senders (room/channel bots with no pubkey to target). Each
+  // stored slot is a NUL-terminated display name.
+  for (int i = 0; i < nn; ++i) {
+    const char* nm = &s_blocked_names_snap[i * TOUCH_IGNORED_NAME_LEN];
+    if (!nm[0]) continue;
+
+    lv_obj_t* row = lv_obj_create(list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, sw - 16, 40);
+    lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 6, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    char shown[40];
+    snprintf(shown, sizeof shown, "%.24s", nm);   // name-only entry
+    lv_label_set_text(lbl, shown);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(lbl, sw - 16 - 96);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl, &g_font_14, LV_PART_MAIN);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
+
+    lv_obj_t* unb = lv_btn_create(row);
+    lv_obj_set_size(unb, 80, 30);
+    lv_obj_align(unb, LV_ALIGN_RIGHT_MID, -6, 0);
+    styleButton(unb);
+    lv_obj_add_event_cb(unb, blockedUnblockNameCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     lv_obj_t* ul = lv_label_create(unb);
     lv_label_set_text(ul, TR("Unblock"));
     lv_obj_set_style_text_font(ul, &g_font_12, LV_PART_MAIN);
@@ -22055,6 +22357,7 @@ static void buildUiTree() {
   s_tb_cursor_y = lv_disp_get_ver_res(nullptr) / 2;
   s_tb_target_x = s_tb_render_x = (float)s_tb_cursor_x;
   s_tb_target_y = s_tb_render_y = (float)s_tb_cursor_y;
+  s_tb_reverse = touchPrefsGetScrollReverse();
 #endif
 
   // ---- Initial data population ----
@@ -23501,6 +23804,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   touchPrefsBegin();
   uint16_t to_s = touchPrefsGetScreenTimeoutSecs();
   _screen_timeout_ms = static_cast<uint32_t>(to_s) * 1000u;
+  s_lock_on_screen_off = touchPrefsGetLockOnScreenOff();
 #endif
   _last_input_ms = millis();
   _screen_off    = false;
@@ -23858,7 +24162,7 @@ bool UITask::ignoreSenderInActiveThread(const char* sender_name) {
       have = true;
     }
   } else if (sender_name && sender_name[0]) {
-    // Channel: resolve the sender display name -> a contact pubkey.
+    // Channel / room: resolve the sender display name -> a contact pubkey.
     ContactInfo c;
     const int n = the_mesh.getNumContacts();
     for (int i = 0; i < n; ++i) {
@@ -23867,6 +24171,13 @@ bool UITask::ignoreSenderInActiveThread(const char* sender_name) {
         have = true;
         break;
       }
+    }
+    if (!have) {
+      // Not a saved contact — e.g. a bot posting inside a joined room, whose
+      // post carries only a display name (no pubkey to put in the prefix
+      // ignore-list). Block by NAME instead so it can actually be silenced;
+      // newMsgImpl drops future posts whose parsed sender matches.
+      return touchPrefsSetNameIgnored(sender_name, true);
     }
   }
   if (!have) return false;
@@ -24181,6 +24492,23 @@ static inline void touchScreenBacklight(bool on) {
 #endif
 }
 
+#if defined(ESP32)
+// Drop the CPU clock while the screen is off to save power. The LoRa radio RX,
+// Wi-Fi and BLE all keep working at 80 MHz (the Wi-Fi floor), so the node never
+// stops listening to the mesh — we just stop burning 240 MHz to render nothing.
+// Restored to 240 MHz on wake so tile decode / rendering stays fast. Only
+// switches when the target changes (the call is a hard DFS switch).
+static void setCpuForScreen(bool screen_on) {
+  static int s_cur_mhz = 240;
+  const int want = screen_on ? 240 : 80;
+  if (want == s_cur_mhz) return;
+  setCpuFrequencyMhz(want);
+  s_cur_mhz = want;
+}
+#else
+static inline void setCpuForScreen(bool) {}
+#endif
+
 void UITask::noteUserInput() {
   /* Called from touch input. If the screen was explicitly locked via the
    * BOOT button, ignore touches entirely — only a BOOT button press can
@@ -24192,6 +24520,7 @@ void UITask::noteUserInput() {
 
 void UITask::wakeScreen() {
   if (!_screen_off) return;
+  setCpuForScreen(true);     // back to 240 MHz before we render
   touchScreenBacklight(true);
   _screen_off    = false;
   _manual_lock   = false;
@@ -24202,6 +24531,7 @@ void UITask::lockScreen() {
   // Backlight off + manual lock so touch is ignored (noteUserInput()
   // early-returns) until a deliberate unlock.
   touchScreenBacklight(false);
+  setCpuForScreen(false);    // screen dark -> drop to 80 MHz
   _screen_off  = true;
   _manual_lock = true;
 #if defined(HAS_TDECK_GT911)
@@ -24214,7 +24544,7 @@ void UITask::lockScreen() {
 void UITask::lockscreenReveal() {
 #if defined(HAS_TDECK_GT911)
   if (!_manual_lock) return;                 // only meaningful while hard-locked
-  if (_screen_off) { touchScreenBacklight(true); _screen_off = false; }
+  if (_screen_off) { setCpuForScreen(true); touchScreenBacklight(true); _screen_off = false; }
   lockscreenShow();                          // ensure built + on top
   _last_input_ms = millis();                 // restart the re-dim timer
 #endif
@@ -24223,6 +24553,7 @@ void UITask::lockscreenReveal() {
 void UITask::unlockScreen() {
   _manual_lock = false;
   _screen_off  = false;
+  setCpuForScreen(true);
   touchScreenBacklight(true);
 #if defined(HAS_TDECK_GT911)
   lockscreenHide();
@@ -24278,23 +24609,11 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
   const char* thread = channel
       ? (from_name && from_name[0] ? from_name : "#unknown")
       : (from_name && from_name[0] ? from_name : "Unknown");
-#if defined(HAS_UI_SOUND)
-  // Notification chime (T-Deck I2S speaker / Heltec V4 piezo). @-mentions get a
-  // distinct sound + their own enable, so an operator can mute message sounds but
-  // still hear @-mentions. Each respects the per-channel mute flags.
-  {
-    const bool is_mention = channel && text && textMentionsMe(text);
-    const uint8_t cmute = channel ? touchPrefsGetChannelMute(thread) : 0;
-    if (!isBuzzerQuiet()) {   // master Sound switch: off = silent, overrules everything
-      if (is_mention && touchPrefsGetSoundMentions() && !(cmute & TOUCH_CHMUTE_MEN)) uiPlayMention();
-      else if (touchPrefsGetSoundMessages() && !(cmute & TOUCH_CHMUTE_MSG))          uiPlayNotify();
-    }
-  }
-#endif
 
   // For channel/group messages the on-wire `text` is "SenderName: body" —
   // split that so the bubble can show the sender as a small label and the
   // body as the message. DMs already arrive with the sender as from_name.
+  // Parsed up here (before the chime) so a blocked sender can be dropped first.
   char parsed_sender[MAX_SENDER_NAME + 1];
   parsed_sender[0] = '\0';
   const char* body = text ? text : "";
@@ -24312,6 +24631,29 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
   const char* sender = channel
       ? (parsed_sender[0] ? parsed_sender : (from_name && from_name[0] ? from_name : "node"))
       : (from_name && from_name[0] ? from_name : "node");
+
+#if defined(ESP32)
+  // Blocked-by-name sender: a channel/room bot we have no pubkey to target via
+  // the prefix ignore-list (room posts carry only a display name). Drop the post
+  // entirely — no bubble, no notification, no chime. Set from the message
+  // long-press "Block" when the sender isn't a saved contact (gubbinsgalore's
+  // self-advertising room bot).
+  if (channel && touchPrefsIsNameIgnored(sender)) return;
+#endif
+
+#if defined(HAS_UI_SOUND)
+  // Notification chime (T-Deck I2S speaker / Heltec V4 piezo). @-mentions get a
+  // distinct sound + their own enable, so an operator can mute message sounds but
+  // still hear @-mentions. Each respects the per-channel mute flags.
+  {
+    const bool is_mention = channel && text && textMentionsMe(text);
+    const uint8_t cmute = channel ? touchPrefsGetChannelMute(thread) : 0;
+    if (!isBuzzerQuiet()) {   // master Sound switch: off = silent, overrules everything
+      if (is_mention && touchPrefsGetSoundMentions() && !(cmute & TOUCH_CHMUTE_MEN)) uiPlayMention();
+      else if (touchPrefsGetSoundMessages() && !(cmute & TOUCH_CHMUTE_MSG))          uiPlayNotify();
+    }
+  }
+#endif
   // Inbound route (repeater hashes) for the Info popup — flood RX only; read
   // synchronously from MyMesh, which stashed it just before this call.
   uint8_t in_path[MAX_UI_PATH];
@@ -24514,6 +24856,7 @@ void UITask::loop() {
         wakeScreen();
       } else {
         touchScreenBacklight(false);
+        setCpuForScreen(false);
         _screen_off  = true;
         _manual_lock = true;  // touch can't unlock until BOOT pressed again
       }
@@ -24549,8 +24892,16 @@ void UITask::loop() {
   // every click. Signed keeps a slightly-ahead stamp negative (= "just had input").
   if (_screen_timeout_ms > 0 && !_screen_off &&
       (int32_t)(now - _last_input_ms) >= (int32_t)_screen_timeout_ms) {
-    touchScreenBacklight(false);
-    _screen_off = true;
+    if (s_lock_on_screen_off) {
+      // "Lock when screen off": idle dim also hard-locks, so the touchscreen is
+      // inert until a deliberate unlock (trackball hold on the T-Deck, BOOT
+      // press on the V4) — Tim's request to stop pocket-taps while dark.
+      lockScreen();
+    } else {
+      touchScreenBacklight(false);
+      setCpuForScreen(false);   // idle dim (no lock) -> drop to 80 MHz too
+      _screen_off = true;
+    }
   }
 
 #if defined(HAS_TOUCH_UI)
