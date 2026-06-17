@@ -9995,9 +9995,25 @@ static void calibrateBatteryCb(lv_event_t* e) {
 // is trimmed to the last 24h. The rewrite streams line-by-line via a temp file,
 // so memory cost is one short String at a time. Tapping the battery in the status
 // bar opens a voltage chart built from that file.
+// Battery log prefers the SD card when present (T-Deck); on boards with no SD
+// slot — or a T-Deck with no card inserted — it falls back to internal SPIFFS so
+// the 24h chart still works. SD path lives under /meshcomod with the other files;
+// SPIFFS (flat) uses a top-level path.
+static fs::FS& battLogFs() {
 #if defined(HAS_TDECK_GT911)
-static const char*    k_batt_log_path      = "/meshcomod/battery.log";
-static const char*    k_batt_log_tmp       = "/meshcomod/battery.tmp";
+  if (SD.cardType() != CARD_NONE) return SD;
+#endif
+  return SPIFFS;
+}
+static bool battLogOnSd() {
+#if defined(HAS_TDECK_GT911)
+  return SD.cardType() != CARD_NONE;
+#else
+  return false;
+#endif
+}
+static const char* battLogPath() { return battLogOnSd() ? "/meshcomod/battery.log" : "/battery.log"; }
+static const char* battLogTmp()  { return battLogOnSd() ? "/meshcomod/battery.tmp" : "/battery.tmp"; }
 static const uint32_t k_batt_log_period_ms = 5u * 60u * 1000u;   // 5 min
 static const uint32_t k_batt_log_keep_secs = 24u * 60u * 60u;    // 24h window
 static lv_obj_t*      s_batt_chart_root    = nullptr;
@@ -10005,13 +10021,13 @@ static lv_obj_t*      s_batt_chart_root    = nullptr;
 // Append one sample + drop anything older than 24h. Line columns (tab-separated,
 // human-readable): <epoch>\t<YYYY-MM-DD HH:MM>\t<millivolts>\t<percent>\t<cpuMHz>
 static void batteryLogAppend(uint32_t epoch, uint16_t mv, int pct, uint16_t cpu_mhz) {
-  if (SD.cardType() == CARD_NONE) return;
-  markSdIo();
+  fs::FS& fs = battLogFs();
+  if (battLogOnSd()) markSdIo();
   char when[20] = "----------------";
   time_t t = (time_t)epoch; struct tm tmv;
   if (epoch > 1700000000 && localtime_r(&t, &tmv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tmv);
-  File rf = SD.open(k_batt_log_path, FILE_READ);
-  File wf = SD.open(k_batt_log_tmp, FILE_WRITE);     // truncate/create
+  File rf = fs.open(battLogPath(), FILE_READ);
+  File wf = fs.open(battLogTmp(), FILE_WRITE);     // truncate/create
   if (!wf) { if (rf) rf.close(); return; }
   if (rf) {
     while (rf.available()) {
@@ -10025,8 +10041,8 @@ static void batteryLogAppend(uint32_t epoch, uint16_t mv, int pct, uint16_t cpu_
   }
   wf.printf("%lu\t%s\t%u\t%d\t%u\n", (unsigned long)epoch, when, (unsigned)mv, pct, (unsigned)cpu_mhz);
   wf.close();
-  SD.remove(k_batt_log_path);
-  SD.rename(k_batt_log_tmp, k_batt_log_path);
+  fs.remove(battLogPath());
+  fs.rename(battLogTmp(), battLogPath());
 }
 
 // Called every UITask::loop tick; rate-limited to k_batt_log_period_ms. No new
@@ -10051,7 +10067,8 @@ static void batteryChartDismissCb(lv_event_t* e) {
 static void batteryChartCloseCb(lv_event_t* e) { (void)e; batteryChartClose(); }  // the X badge
 static void openBatteryChartWindow();   // fwd (clear reopens to show the empty chart)
 static void batteryLogClearConfirmed() {
-  if (SD.cardType() != CARD_NONE) { markSdIo(); SD.remove(k_batt_log_path); }
+  if (battLogOnSd()) markSdIo();
+  battLogFs().remove(battLogPath());
   batteryChartClose();
   openBatteryChartWindow();
 }
@@ -10152,9 +10169,9 @@ static void openBatteryChartWindow() {
   static uint16_t cpus[k_max_pts];
   static uint32_t eps[k_max_pts];
   int n = 0;
-  if (SD.cardType() != CARD_NONE) {
-    markSdIo();
-    File rf = SD.open(k_batt_log_path, FILE_READ);
+  {
+    if (battLogOnSd()) markSdIo();
+    File rf = battLogFs().open(battLogPath(), FILE_READ);
     if (rf) {
       while (rf.available() && n < k_max_pts) {
         String ln = rf.readStringUntil('\n');
@@ -10177,7 +10194,7 @@ static void openBatteryChartWindow() {
 
   if (n <= 0) {
     lv_obj_t* empty = lv_label_create(card);
-    lv_label_set_text(empty, TR("No battery history yet.\n\nLogged to /meshcomod/battery.log\nevery 5 minutes."));
+    lv_label_set_text(empty, TR("No battery history yet.\n\nLogged every 5 minutes."));
     lv_obj_set_style_text_color(empty, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
     lv_obj_set_style_text_font(empty, &g_font_12, LV_PART_MAIN);
     lv_obj_set_pos(empty, 0, 28);
@@ -10316,22 +10333,25 @@ static void batteryTapCb(lv_event_t* e) {
   openBatteryChartWindow();
 }
 
-// ----- Per-node telemetry log (/telemetry/<id>.log) -----
+#if defined(HAS_TDECK_GT911)
+// ----- Per-node telemetry log (/meshcomod/telemetry/<id>.log) -----
 // One file per node (6-byte pubkey prefix, hex). Columns (tab-separated):
 //   epoch \t YYYY-MM-DD HH:MM \t battery_mv \t tempC*10 \t humidity%
 // Missing sensors use sentinels (mv=0, t10=-30000, hum=-1) -> drawn as gaps.
 // Trimmed to a 7-day window via a streaming temp-file rewrite (like battery.log).
+// SD-backed (T-Deck only); telemetry on V4 stays request/reply-only (a toast).
 static const uint32_t k_telem_keep_secs = 7u * 24u * 60u * 60u;
 static void telemetryNodePath(const uint8_t* key, char* out, size_t cap) {
-  snprintf(out, cap, "/telemetry/%02X%02X%02X%02X%02X%02X.log",
+  snprintf(out, cap, "/meshcomod/telemetry/%02X%02X%02X%02X%02X%02X.log",
            key[0], key[1], key[2], key[3], key[4], key[5]);
 }
 static void telemetryLogAppend(const uint8_t* key, uint32_t epoch, int mv, int t10, int hum) {
   if (SD.cardType() == CARD_NONE) return;
   markSdIo();
-  SD.mkdir("/telemetry");
-  char path[40]; telemetryNodePath(key, path, sizeof path);
-  const char* tmp = "/telemetry/_t.tmp";
+  SD.mkdir("/meshcomod");
+  SD.mkdir("/meshcomod/telemetry");
+  char path[48]; telemetryNodePath(key, path, sizeof path);
+  const char* tmp = "/meshcomod/telemetry/_t.tmp";
   char when[20] = "----------------"; time_t t = (time_t)epoch; struct tm tmv;
   if (epoch > 1700000000 && localtime_r(&t, &tmv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tmv);
   File rf = SD.open(path, FILE_READ);
@@ -21816,17 +21836,16 @@ static void buildGlobalStatusBar() {
   lv_obj_set_style_text_font(g_statusbar.batt_pct, &g_font_12, LV_PART_MAIN);
   lv_obj_align(g_statusbar.batt_pct, LV_ALIGN_RIGHT_MID, -22, 0);
 
-#if defined(HAS_TDECK_GT911)
-  // Tapping the battery (icon or %) opens the 24h battery-history chart. Generous
-  // ext-click area so the small glyphs are easy to hit; the rest of the bar still
-  // routes to statusBarTapCb (control center).
+  // Tapping the battery (icon or %) opens the 24h battery-history chart (logged to
+  // SD on T-Deck, else internal SPIFFS — works on both builds). Generous ext-click
+  // area so the small glyphs are easy to hit; the rest of the bar still routes to
+  // statusBarTapCb (control center).
   lv_obj_add_flag(g_statusbar.batt_icon, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_ext_click_area(g_statusbar.batt_icon, 10);
   lv_obj_add_event_cb(g_statusbar.batt_icon, batteryTapCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_flag(g_statusbar.batt_pct, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_ext_click_area(g_statusbar.batt_pct, 10);
   lv_obj_add_event_cb(g_statusbar.batt_pct, batteryTapCb, LV_EVENT_CLICKED, nullptr);
-#endif
 
   g_statusbar.clock = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.clock, TR("--:--"));
@@ -23817,7 +23836,7 @@ static void telemetryWindowDismissCb(lv_event_t* e) {
   telemetryClose();
 }
 static void telemetryCloseCb(lv_event_t* e) { (void)e; telemetryClose(); }   // the X badge
-// ---------- Telemetry auto-poll (per node; persisted /telemetry/poll.cfg) ----------
+// ---------- Telemetry auto-poll (per node; persisted /meshcomod/telemetry/poll.cfg) ----------
 struct TelemPoll { uint8_t key[6]; uint16_t interval_min; uint32_t next_ms; bool used; };
 static const int      k_telem_poll_max = 8;
 static TelemPoll      s_telem_poll[k_telem_poll_max];
@@ -23836,7 +23855,7 @@ static void telemetryPollLoad() {
   s_telem_poll_loaded = true;
   for (auto& e : s_telem_poll) e.used = false;
   if (SD.cardType() == CARD_NONE) return;
-  File f = SD.open("/telemetry/poll.cfg", FILE_READ);
+  File f = SD.open("/meshcomod/telemetry/poll.cfg", FILE_READ);
   if (!f) return;
   int idx = 0;
   while (f.available() && idx < k_telem_poll_max) {
@@ -23856,8 +23875,9 @@ static void telemetryPollLoad() {
 static void telemetryPollSave() {
   if (SD.cardType() == CARD_NONE) return;
   markSdIo();
-  SD.mkdir("/telemetry");
-  File f = SD.open("/telemetry/poll.cfg", FILE_WRITE);
+  SD.mkdir("/meshcomod");
+  SD.mkdir("/meshcomod/telemetry");
+  File f = SD.open("/meshcomod/telemetry/poll.cfg", FILE_WRITE);
   if (!f) return;
   for (auto& e : s_telem_poll)
     if (e.used) f.printf("%02X%02X%02X%02X%02X%02X %u\n",
@@ -26913,8 +26933,8 @@ void UITask::loop() {
     }
   }
 
+  batteryLogTick((uint32_t)now);   // 5-min battery sample (SD on T-Deck, else SPIFFS)
 #if defined(HAS_TDECK_GT911)
-  batteryLogTick((uint32_t)now);   // 5-min battery sample -> /meshcomod/battery.log
   telemetryPollTick((uint32_t)now); // auto-poll due nodes -> log (no window)
 #endif
   versionCheckService(now);   // firmware update check (gear badge + About line)
