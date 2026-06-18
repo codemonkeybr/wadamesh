@@ -1920,6 +1920,19 @@ static void versionCheckService(unsigned long now) {
 #endif
 }
 static void applySwipeGesture(int8_t swipe_x, int8_t swipe_y) {
+  // The Snake game owns the whole screen while it's open: steer with the swipe
+  // and return, so it can never reach the tab switcher / map pan / control
+  // centre behind the overlay. This reuses the per-board hardware swipe detector
+  // that drives tab switching (reliable on both the V4 cap-touch and the T-Deck
+  // GT911), since LVGL's own LV_EVENT_GESTURE doesn't fire dependably on the
+  // cap-touch — so this, not SnakeGame's gestureCb, is what makes touch steering
+  // actually work. swipe_x<0 == left, swipe_y<0 == up (see the control-center
+  // note below for the sign convention).
+  if (SnakeGame::isOpen()) {
+    if (swipe_x != 0)      SnakeGame::steer(swipe_x < 0 ? -1 : 1, 0);
+    else if (swipe_y != 0) SnakeGame::steer(0, swipe_y < 0 ? -1 : 1);
+    return;
+  }
   // A slider was just being dragged — its horizontal drag must NOT be read as a
   // tab/back swipe (e.g. raising the volume slider rightward kept triggering the
   // settings "swipe right = back"). Ignore swipes briefly after any slider touch.
@@ -21835,7 +21848,38 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
   lv_obj_set_style_border_width(chip_o, 1, LV_PART_MAIN);
   lv_obj_set_style_border_opa(chip_o, LV_OPA_50, LV_PART_MAIN);
 
-  if (icon) {
+  if (act == APPACT_SNAKE) {
+    // The 🐍 emoji (U+1F40D) isn't in the baked colour-emoji set, so a plain
+    // label renders it as a tofu box. Draw the game's blocky snake from a few
+    // rounded cells instead — self-contained, on-theme, and scales with the chip.
+    lv_obj_t* box = lv_obj_create(chip_o);
+    lv_obj_remove_style_all(box);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(box, 18, 12);
+    lv_obj_center(box);
+    // Tail bottom-left -> right -> up -> head top-right (cells share edges, so the
+    // body reads as one continuous snake).
+    static const struct { int8_t x, y; } seg[4] = { {0,6}, {6,6}, {6,0}, {12,0} };
+    for (int s = 0; s < 4; s++) {
+      lv_obj_t* cell = lv_obj_create(box);
+      lv_obj_remove_style_all(cell);
+      lv_obj_clear_flag(cell, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_set_size(cell, 6, 6);
+      lv_obj_set_pos(cell, seg[s].x, seg[s].y);
+      lv_obj_set_style_bg_color(cell, lv_color_hex(icon_col), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_radius(cell, 2, LV_PART_MAIN);
+    }
+    // Dark pupil on the head cell (the last segment, facing right).
+    lv_obj_t* eye = lv_obj_create(box);
+    lv_obj_remove_style_all(eye);
+    lv_obj_clear_flag(eye, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(eye, 2, 2);
+    lv_obj_set_pos(eye, 14, 1);
+    lv_obj_set_style_bg_color(eye, lv_color_hex(0x0E1216), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(eye, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(eye, 1, LV_PART_MAIN);
+  } else if (icon) {
     lv_obj_t* ic = lv_label_create(chip_o);
     lv_label_set_text(ic, icon);
     lv_obj_set_style_text_font(ic, &g_font_16, LV_PART_MAIN);
@@ -21904,8 +21948,14 @@ static void openAppDrawer() {
   lv_obj_set_style_bg_color(s_appdrawer_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_appdrawer_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_scroll_dir(s_appdrawer_root, LV_DIR_VER);   // grid scrolls top->bottom when it overflows
-  lv_obj_set_scrollbar_mode(s_appdrawer_root, LV_SCROLLBAR_MODE_AUTO);
   lv_obj_set_style_pad_bottom(s_appdrawer_root, 10, LV_PART_MAIN);   // room past the last row when scrolled
+  // A clearly visible scrollbar so users discover the lower rows. The mode is
+  // set after the grid is measured (ON when it overflows, OFF when it all fits).
+  lv_obj_set_style_bg_color(s_appdrawer_root, lv_color_hex(COLOR_ACCENT), LV_PART_SCROLLBAR);
+  lv_obj_set_style_bg_opa(s_appdrawer_root, LV_OPA_70, LV_PART_SCROLLBAR);
+  lv_obj_set_style_width(s_appdrawer_root, 5, LV_PART_SCROLLBAR);
+  lv_obj_set_style_radius(s_appdrawer_root, 3, LV_PART_SCROLLBAR);
+  lv_obj_set_style_pad_right(s_appdrawer_root, 2, LV_PART_SCROLLBAR);
   lv_obj_move_foreground(s_appdrawer_root);
 
   // First tile is "Command" (back to the command centre); the rest are the apps.
@@ -21927,7 +21977,7 @@ static void openAppDrawer() {
     { ">_",                "Terminal",  APPACT_TERMINAL, 0,         0x3DD27A },      // console green
     { LV_SYMBOL_DIRECTORY, "Files",     APPACT_FILES,    0,         0xE6BE4A },      // folder gold
 #endif
-    { "\xF0\x9F\x90\x8D",  "Snake",     APPACT_SNAKE,    0,         0x53C06B },      // snake game
+    { nullptr,             "Snake",     APPACT_SNAKE,    0,         0x53C06B },      // snake game (icon drawn from APPACT_SNAKE, not a glyph)
     { LV_SYMBOL_POWER,     "Power",     APPACT_POWER,    0,         0xE05544 },      // power red
   };
   const int n = (int)(sizeof(tiles) / sizeof(tiles[0]));
@@ -21948,13 +21998,23 @@ static void openAppDrawer() {
   const int avail  = (sh - STATUSBAR_H - TABBAR_H) - top - 8;   // content area minus top inset + bottom margin
   int tile_h = (avail - (rows - 1) * gap) / rows;
   if (tile_h > 84) tile_h = 84;
-  if (tile_h < 60) tile_h = 60;   // floor: overflow scrolls instead of shrinking to tiny tiles
+  if (tile_h < 54) tile_h = 54;   // floor: overflow scrolls instead of shrinking to tiny tiles
+                                  // (54, not 60, so the V4's 4-row grid fits on screen rather than
+                                  //  clipping the bottom row's label by a few px)
   for (int i = 0; i < n; i++) {
     const int col = i % cols, row = i / cols;
     addAppTile(s_appdrawer_root, pad + col * (tile_w + gap), top + row * (tile_h + gap),
                tile_w, tile_h, tiles[i].icon, tiles[i].label, tiles[i].act, tiles[i].badge,
                tiles[i].color);
   }
+
+  // Keep the scrollbar permanently visible only when the grid actually overflows
+  // the drawer area (so it's discoverable); when it all fits, hide it so there's
+  // no misleading full-height thumb.
+  const int grid_h  = top + rows * tile_h + (rows - 1) * gap + 10 /*pad_bottom*/;
+  const int visible = sh - STATUSBAR_H - TABBAR_H;
+  lv_obj_set_scrollbar_mode(s_appdrawer_root,
+                            grid_h > visible ? LV_SCROLLBAR_MODE_ON : LV_SCROLLBAR_MODE_OFF);
 }
 
 // Status-bar long-hold (3 s) -> full-screen screenshot to /screenshots on SD.
@@ -21978,6 +22038,10 @@ static void statusBarHoldCb(lv_event_t* e) {
 
 static void statusBarTapCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  // The status bar lives on lv_layer_sys, ABOVE the Snake overlay, so it stays
+  // tappable while the game is up. Swallow the tap so it can't open the control
+  // centre over the game.
+  if (SnakeGame::isOpen()) return;
   if (s_sb_shot_done) { s_sb_shot_done = false; return; }   // this press was a screenshot hold
   // While a settings detail sheet is open the bar shows its Back chevron + title,
   // so a tap means "go back" rather than opening the control center.
