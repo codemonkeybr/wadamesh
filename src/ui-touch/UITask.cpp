@@ -29,6 +29,7 @@
   #include <Esp.h>
   #include <esp_ota_ops.h>     // A/B slot info + reboot-to-recovery (esp_ota_get_running_partition)
   #include <esp_partition.h>   // find/erase otadata to fall back to the factory(recovery) slot
+  #include <esp_core_dump.h>   // detect/read/erase the panic coredump for the crash-report export
 #endif
 #if defined(HAS_TDECK_GT911)
   #include <SD.h>             // microSD (CS=39) on the shared LoRa SPI bus
@@ -1053,6 +1054,7 @@ static bool g_cap_touch_hw_started = false;
 // LVGL just calls flush_cb more often.
 static constexpr int LV_DRAW_BUF_LINES = 24;
 static lv_color_t* g_draw_buffer = nullptr;
+static uint32_t    g_draw_buf_px  = 240 * LV_DRAW_BUF_LINES;   // actual buffer size in px; shrinks if the full alloc fails at boot
 
 // ---- Global UI state instance ----
 LvUiState g_lv = {};
@@ -1458,6 +1460,7 @@ static int         g_shot_h   = 0;
 
 static void lvglFlush(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_color_t* color_p) {
   (void)disp_drv;
+  if (!color_p) { lv_disp_flush_ready(disp_drv); return; }   // never deref a NULL draw buffer (OOM at boot)
   int32_t w = area->x2 - area->x1 + 1;
   int32_t h = area->y2 - area->y1 + 1;
   display.writePixelsRGB565(area->x1, area->y1, w, h, reinterpret_cast<uint16_t*>(color_p));
@@ -9810,9 +9813,11 @@ static void chatsMarkAllReadBtnCb(lv_event_t* e) {
 // touch device can scan it (with a phone or another firmware build that
 // grows a camera/scanner later) and import us as a contact.
 //
-// Payload format: `meshcore://add?p=<64-hex pubkey>&n=<name>`. Compact
-// URL-ish form so a generic phone QR app can show it as a tappable link
-// (firmware scanners can lift the p= / n= fields directly).
+// Payload = the official MeshCore contact-share URI so the phone app's "Add
+// Contact → Scan QR Code" imports us directly:
+//   meshcore://contact/add?name=<urlenc>&public_key=<64 lowercase hex>&type=1
+// (per docs.meshcore.io/qr_codes). The old home-grown `meshcore://add?p=…&n=…`
+// form was parseable by nothing — that was issue #16 ("wrong QR").
 static lv_obj_t* s_share_my_root = nullptr;
 
 static void closeShareMyContact() {
@@ -9866,7 +9871,12 @@ static void openShareMyContactPopup() {
     name_enc[o] = '\0';
   }
   char payload[256];
-  snprintf(payload, sizeof(payload), "meshcore://add?p=%s&n=%s", pub_hex, name_enc);
+  // Official MeshCore contact-share URI (matches what the phone app's "Add Contact
+  // → Scan QR Code" expects): meshcore://contact/add?name=<urlenc>&public_key=<64
+  // lowercase hex>&type=<1=Companion,2=Repeater,3=Room,4=Sensor>. A touch radio is
+  // always a Companion. The old `meshcore://add?p=…&n=…` form parsed in nothing.
+  snprintf(payload, sizeof(payload),
+           "meshcore://contact/add?name=%s&public_key=%s&type=1", name_enc, pub_hex);
 
   lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -14355,8 +14365,11 @@ static uint32_t          s_tile_fetch_dedup[k_tile_fetch_dedup_size] = {0};
 static int               s_tile_fetch_dedup_head = 0;
 
 static inline uint32_t tileFetchDedupKey(uint8_t z, int32_t x, int32_t y) {
-  // z in 4 bits, x in 14, y in 14 — fits at zooms up to 16.
-  return (((uint32_t)z & 0xF) << 28) | (((uint32_t)x & 0x3FFF) << 14) | ((uint32_t)y & 0x3FFF);
+  // Hash, NOT a bit-pack: the old 14-bit x/y fields overflowed at z15+ (coords up
+  // to 32767 masked to 14 bits → guaranteed collisions), which silently suppressed
+  // re-fetches of corrupt z13-15 tiles (the reported "reload doesn't work" zooms).
+  // A multiplicative hash makes collisions rare across the 48-slot ring.
+  return ((uint32_t)z * 2654435761u) ^ ((uint32_t)x * 40503u) ^ (uint32_t)y;
 }
 static bool tileFetchSeen(uint8_t z, int32_t x, int32_t y) {
   const uint32_t k = tileFetchDedupKey(z, x, y);
@@ -15270,6 +15283,15 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
   const size_t n = f.read(buf, sz);
   f.close();
   if (n != sz) { lvglPsramFree(buf); return false; }
+  // Reject a cached tile whose header isn't a JPEG SOI — a garbled/partial download
+  // that slipped through decodes to a blank/half "twilight zone" tile otherwise.
+  // Drop it from the writable online cache so the render miss re-queues a fresh
+  // fetch; never touch read-only SD map packs (can't re-download those).
+  if (sz < 3 || buf[0] != 0xFF || buf[1] != 0xD8 || buf[2] != 0xFF) {
+    lvglPsramFree(buf);
+    if (!s_tiles_from_sd) tileCacheRemove(path);
+    return false;
+  }
   *out_data = buf;
   *out_len  = sz;
   return true;
@@ -16225,10 +16247,6 @@ static void mapReloadVisibleTiles() {
     if (g_lv.task) g_lv.task->showAlert(TR("Set your location first"), 1600);
     return;
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    if (g_lv.task) g_lv.task->showAlert(TR("Connect Wi-Fi to reload tiles"), 2000);
-    return;
-  }
   double cwx, cwy;
   latLonToWorldPx(s_map_center_lat, s_map_center_lon, s_map_zoom, &cwx, &cwy);
   const int32_t ctx = (int32_t)floor(cwx / 256.0);
@@ -16237,24 +16255,37 @@ static void mapReloadVisibleTiles() {
   // misses, since we delete the files below) → re-queues the download.
   freeMapTiles();
   int n = 0;
-  for (int dy = -k_map_grid_radius; dy <= k_map_grid_radius; ++dy) {
-    for (int dx = -k_map_grid_radius; dx <= k_map_grid_radius; ++dx) {
-      const int32_t tx = ctx + dx, ty = cty + dy;
-      char path[48];
-      snprintf(path, sizeof(path), "/tiles/%u/%ld/%ld.jpg",
-               (unsigned)s_map_zoom, (long)tx, (long)ty);
-      if (s_tiles_fs_ready && tileCacheExists(path)) tileCacheRemove(path);
-      // Clear the dedup ring entry so queueTileForFetch doesn't skip it as
-      // "seen recently".
-      const uint32_t k = tileFetchDedupKey(s_map_zoom, tx, ty);
-      for (int i = 0; i < k_tile_fetch_dedup_size; ++i)
-        if (s_tile_fetch_dedup[i] == k) s_tile_fetch_dedup[i] = 0;
-      ++n;
+  // Purge the on-disk cache for the visible band (current zoom ± 1) so a corrupt
+  // tile is ALWAYS removed — even offline. This deletion used to sit behind the
+  // Wi-Fi gate below, so the button did nothing exactly when you were staring at
+  // a bad cached tile with no connection; the re-download just happens on the next
+  // render once Wi-Fi is back.
+  for (int dz = -1; dz <= 1; ++dz) {
+    const int z = (int)s_map_zoom + dz;
+    if (z < (int)k_map_zoom_min || z > (int)k_map_zoom_max) continue;
+    double zwx, zwy;
+    latLonToWorldPx(s_map_center_lat, s_map_center_lon, (uint8_t)z, &zwx, &zwy);
+    const int32_t zctx = (int32_t)floor(zwx / 256.0), zcty = (int32_t)floor(zwy / 256.0);
+    for (int dy = -k_map_grid_radius; dy <= k_map_grid_radius; ++dy) {
+      for (int dx = -k_map_grid_radius; dx <= k_map_grid_radius; ++dx) {
+        const int32_t tx = zctx + dx, ty = zcty + dy;
+        char path[48];
+        snprintf(path, sizeof(path), "/tiles/%u/%ld/%ld.jpg", (unsigned)z, (long)tx, (long)ty);
+        if (s_tiles_fs_ready && tileCacheExists(path)) { tileCacheRemove(path); ++n; }
+        const uint32_t k = tileFetchDedupKey((uint8_t)z, tx, ty);   // clear dedup so it re-queues
+        for (int i = 0; i < k_tile_fetch_dedup_size; ++i)
+          if (s_tile_fetch_dedup[i] == k) s_tile_fetch_dedup[i] = 0;
+      }
     }
   }
-  char msg[40];
-  snprintf(msg, sizeof(msg), "Reloading %d tiles\xE2\x80\xA6", n);
-  if (g_lv.task) g_lv.task->showAlert(msg, 1600);
+  if (g_lv.task) {
+    if (WiFi.status() == WL_CONNECTED) {
+      char msg[44]; snprintf(msg, sizeof(msg), "Reloading %d tiles\xE2\x80\xA6", n);
+      g_lv.task->showAlert(msg, 1600);
+    } else {
+      g_lv.task->showAlert(TR("Tiles cleared \xE2\x80\x94 reconnect Wi-Fi to re-download"), 2400);
+    }
+  }
   renderMapTiles();      // misses on the just-deleted files → queues fresh fetches
   renderMapMarkers();
 }
@@ -17759,6 +17790,76 @@ static void buildLanguageSettings() {
 // sheet's scroll page). Only one category is ever built at a time (the sheet is
 // destroyed on close), keeping DRAM low. About builds its live status labels as
 // direct children of the page, toggling the inline parent like the old sub-tab.
+#if defined(ESP32)
+// ---- Crash report (coredump) export ---------------------------------------
+// On a panic the IDF writes an ELF coredump to the 'coredump' flash partition
+// (0xFF0000, 64 KB). Surface it so users can hand a crash to the devs: detect it
+// at boot (crashDumpCheck) and let them save it to the SD card / SPIFFS from
+// Settings → About. Decode later with xtensa-esp32s3-elf-gdb against the matching
+// firmware.elf — see the tdeck-coredump-decode notes.
+static size_t s_crash_dump_size = 0;     // bytes of a pending dump; 0 = none
+
+static void crashDumpCheck() {
+  size_t addr = 0, size = 0;
+  if (esp_core_dump_image_check() == ESP_OK &&
+      esp_core_dump_image_get(&addr, &size) == ESP_OK && size > 0 && size < (1u << 20)) {
+    s_crash_dump_size = size;
+  }
+}
+
+// Copy the raw ELF coredump to a file. Prefers SD (T-Deck), falls back to SPIFFS.
+// On success fills out_path ("SD /…" or "Internal /…"), erases the flash dump (the
+// file is now the durable copy) and clears s_crash_dump_size. False on any failure
+// (dump left intact so it can be retried).
+static bool crashDumpExport(char* out_path, size_t out_cap) {
+  if (s_crash_dump_size == 0) return false;
+  const esp_partition_t* part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, nullptr);
+  if (!part) return false;
+  size_t size = s_crash_dump_size;
+  if (size > part->size) size = part->size;
+
+  bool used_sd = false;
+  fs::FS* dst = nullptr;
+  const char* path = "/wadamesh-crash.elf";
+#if defined(HAS_TDECK_GT911)
+  if (fmSdTryMount()) { dst = &SD; used_sd = true; }
+#endif
+  if (!dst) { SPIFFS.begin(false); dst = &SPIFFS; }
+  File f = dst->open(path, "w");
+  if (!f) return false;
+
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+  if (!buf) buf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_8BIT);
+  if (!buf) { f.close(); return false; }
+  bool ok = true; size_t off = 0;
+  while (off < size) {
+    size_t n = (size - off > 4096) ? 4096 : (size - off);
+    if (esp_partition_read(part, off, buf, n) != ESP_OK || f.write(buf, n) != n) { ok = false; break; }
+    off += n;
+  }
+  heap_caps_free(buf);
+  f.close();
+  if (!ok) { dst->remove(path); return false; }
+  esp_core_dump_image_erase();   // the file is the durable copy now; clears the boot warning
+  s_crash_dump_size = 0;
+  snprintf(out_path, out_cap, "%s%s", used_sd ? "SD " : "Internal ", path);
+  return true;
+}
+
+static void crashDumpExportCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  char path[80] = {0};
+  if (crashDumpExport(path, sizeof path)) {
+    char msg[140]; snprintf(msg, sizeof msg, "Crash report saved:\n%s\nShare it with the devs", path);
+    g_lv.task->showAlert(msg, 3500);
+    lv_obj_add_flag((lv_obj_t*)lv_event_get_target(e), LV_OBJ_FLAG_HIDDEN);   // done — hide the button
+  } else {
+    g_lv.task->showAlert("Crash export failed", 2000);
+  }
+}
+#endif  // ESP32
+
 static void settingsCatBuild(int cat) {
   lv_obj_t* page = s_settings_inline_parent;
   const lv_coord_t lblw = lv_disp_get_hor_res(nullptr) - 16;
@@ -17812,6 +17913,24 @@ static void settingsCatBuild(int cat) {
       }
 #endif
 
+#if defined(ESP32)
+      // Crash-report export — only when a panic coredump is waiting in flash.
+      if (s_crash_dump_size > 0) {
+        lv_obj_t* crash_btn = lv_btn_create(page);
+        lv_obj_set_size(crash_btn, lblw, 38);
+        styleButton(crash_btn);
+        lv_obj_set_style_bg_color(crash_btn, lv_color_hex(0x8A3B2E), LV_PART_MAIN);  // warning red-brown
+        lv_obj_add_event_cb(crash_btn, crashDumpExportCb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t* cbl = lv_label_create(crash_btn);
+        char ct[56];
+        snprintf(ct, sizeof ct, LV_SYMBOL_WARNING "  Export crash report (%uK)",
+                 (unsigned)(s_crash_dump_size / 1024));
+        lv_label_set_text(cbl, ct);
+        lv_obj_set_style_text_font(cbl, &g_font_14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(cbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+        lv_obj_center(cbl);
+      }
+#endif
       s_settings_inline_parent = page;  buildSystemInfoSettings();
       s_settings_inline_parent = nullptr;
       g_lv.settings_status = lv_label_create(page);
@@ -18724,7 +18843,13 @@ static void refreshChatDetail(LvChatPanel& p) {
   // messages stream in (gated on detail_open so a stale active idx after the
   // panel is closed can't wrongly clear an inbox badge).
   if (p.detail_open) g_lv.task->markActiveThreadRead();
-  int msg_idx[UITask::MAX_UI_MESSAGES];
+  // Index scratch in PSRAM, NOT on the 8 KB loop-task stack — 500 ints = 2 KB, and
+  // the LVGL render below is already deeply stack-hungry; this runs on every RX while
+  // a chat is open. Cached + never freed; only the single UI task reaches here.
+  static int* msg_idx = nullptr;
+  if (!msg_idx) { msg_idx = (int*)heap_caps_malloc(sizeof(int) * UITask::MAX_UI_MESSAGES, MALLOC_CAP_SPIRAM);
+                  if (!msg_idx) msg_idx = (int*)heap_caps_malloc(sizeof(int) * UITask::MAX_UI_MESSAGES, MALLOC_CAP_8BIT); }
+  if (!msg_idx) { chatDetailShowPlaceholder(p, "Low memory"); return; }
   int n = g_lv.task->getActiveThreadMessageCount(msg_idx, UITask::MAX_UI_MESSAGES, false);
   if (n <= 0) {
     chatDetailShowPlaceholder(p, "No messages yet.\nSay hello!");
@@ -18769,6 +18894,15 @@ static void refreshChatDetail(LvChatPanel& p) {
   lv_coord_t divider_y = -1;
   lv_coord_t jump_y    = -1;   // y of the tapped @mention message, if it's in the rendered window
 
+  // A room server is a DM-panel contact thread (channel_mode == false) but, like a
+  // channel, carries many senders as "<Name>: <body>" in the text. Detect it so the
+  // bubbles below show a per-message sender label + split the name out — WITHOUT
+  // flipping the thread to channel mode (that would break the room-reply send path).
+  bool thread_is_room = false;
+  if (!p.channel_mode) {
+    ContactInfo rc;
+    if (g_lv.task->lookupActiveContact(rc)) thread_is_room = (rc.type == ADV_TYPE_ROOM);
+  }
   lv_coord_t y_pos = 0;
   for (int i = render_start; i < n; ++i) {
     if (divider_i >= 0 && !divider_done && i == divider_i) {
@@ -18804,8 +18938,13 @@ static void refreshChatDetail(LvChatPanel& p) {
     const char* show_sender = m.sender;
     const char* show_text   = m.text;
     char retro_sender[UITask::MAX_SENDER_NAME + 1] = "";
-    if (p.channel_mode && !m.outgoing &&
-        (m.sender[0] == '\0' || (m.sender[0] == 'r' && m.sender[1] == 'x' && m.sender[2] == '\0'))) {
+    // Room: m.sender holds the ROOM name (the real sender is "<Name>: " in the text),
+    // so ALWAYS split. Channel retro-compat: only split when the sender wasn't parsed
+    // at receive (empty / legacy "rx").
+    if (!m.outgoing &&
+        (thread_is_room ||
+         (p.channel_mode &&
+          (m.sender[0] == '\0' || (m.sender[0] == 'r' && m.sender[1] == 'x' && m.sender[2] == '\0'))))) {
       const char* colon = strstr(m.text, ": ");
       if (colon) {
         int slen = static_cast<int>(colon - m.text);
@@ -18827,7 +18966,7 @@ static void refreshChatDetail(LvChatPanel& p) {
     lv_obj_remove_style_all(bubble);
     lv_obj_clear_flag(bubble, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_radius(bubble, 10, LV_PART_MAIN);
-    const bool mentions_me = p.channel_mode && !m.outgoing && textMentionsMe(show_text);
+    const bool mentions_me = (p.channel_mode || thread_is_room) && !m.outgoing && textMentionsMe(show_text);
     // Colourful-bubbles option: tint the bubble + sender name by a hash of the
     // name (outgoing bubbles colour by our own node name). The @mention
     // highlight still wins for the background — keeps the "you were tagged" cue.
@@ -18850,7 +18989,7 @@ static void refreshChatDetail(LvChatPanel& p) {
     // Group/channel rooms show the sender name as a small accent line above
     // the message text (mirrors WhatsApp group chats). DMs skip it — you
     // already know who you're talking to.
-    if (p.channel_mode && !m.outgoing && san_sender[0]) {
+    if ((p.channel_mode || thread_is_room) && !m.outgoing && san_sender[0]) {
       lv_obj_t* slbl = lv_label_create(bubble);
       lv_label_set_text(slbl, san_sender);
       lv_obj_set_style_text_font(slbl, &g_font_12, LV_PART_MAIN);
@@ -19126,7 +19265,12 @@ static void refreshChatList(LvChatPanel& p) {
       lv_obj_t* badge = lv_label_create(btn);
       lv_obj_add_flag(badge, LV_OBJ_FLAG_IGNORE_LAYOUT);   // float, not in the row flex
       char cnt[8];
-      snprintf(cnt, sizeof cnt, "%u", (unsigned)unread);
+      // Cap the badge like every chat app: `unread` is a per-thread accumulator that
+      // keeps climbing while you're NOT viewing the thread (even as the 500-msg ring
+      // evicts the old messages), so a busy channel legitimately hits the hundreds —
+      // showing a raw "328" reads as a bug. 99+ is the expected, non-alarming cap.
+      if (unread > 99) snprintf(cnt, sizeof cnt, "99+");
+      else             snprintf(cnt, sizeof cnt, "%u", (unsigned)unread);
       lv_label_set_text(badge, cnt);
       lv_obj_set_style_text_font(badge, &g_font_12, LV_PART_MAIN);
       lv_obj_set_style_text_color(badge, lv_color_hex(0x0A0B0C), LV_PART_MAIN);
@@ -19356,6 +19500,11 @@ static void refreshContactsList() {
     }
     search_lc[n] = '\0';
   }
+  // Two passes so a FAVORITED contact is never starved out of the 128-row render
+  // budget by hundreds of same-prefix contacts ahead of it in storage order (#17):
+  // pass 0 captures favorites, pass 1 fills the rest. The render cap stays (2000
+  // LVGL rows is infeasible) but favorites always make the cut now.
+  for (int pass = 0; pass < 2 && n_entries < 128; ++pass)
   for (int i = 0; i < curr_count && n_entries < 128; ++i) {
     ContactInfo c;
     if (!the_mesh.getContactByIdx(static_cast<uint32_t>(i), c) || !c.name[0]) continue;
@@ -19369,6 +19518,7 @@ static void refreshContactsList() {
     const bool is_fav = false;
     const bool is_blocked = false;
 #endif
+    if ((pass == 0) != is_fav) continue;   // pass 0 = favorites only; pass 1 = everything else
     // Shared predicate (category filter incl. "has location" + name search) so
     // the rendered list and the multi-select "Select all" apply IDENTICAL rules.
     if (!ctPassesFilter(c, is_fav, fav_count, have_search ? search_lc : nullptr)) continue;
@@ -20276,8 +20426,19 @@ static void lockColorChosenCb(lv_event_t* e) {
 // above because the Import button exists on both touch boards (the Heltec has
 // no SD slot, so it lists internal flash only).
 static lv_obj_t* s_backup_picker = nullptr;
-static char      s_backup_paths[24][160];   // "int:/foo.json" | "sd:/foo.json"
-static char      s_backup_disp [24][48];    // shown label, e.g. "SD: foo.json"
+// Backup-picker scratch — lazy PSRAM (allocated on first scan, internal fallback):
+// keeps 24*(160+48) ≈ 5 KB off scarce internal DRAM. Allocated once and never freed,
+// so the per-row LVGL callbacks that capture &s_backup_paths[i] stay valid for life.
+static constexpr int kBackupMax = 24;
+static char (*s_backup_paths)[160] = nullptr;   // "int:/foo.json" | "sd:/foo.json"
+static char (*s_backup_disp )[48]  = nullptr;   // shown label, e.g. "SD: foo.json"
+static bool backupBufReady() {
+  if (!s_backup_paths) { s_backup_paths = (char(*)[160])heap_caps_malloc(kBackupMax * 160, MALLOC_CAP_SPIRAM);
+                         if (!s_backup_paths) s_backup_paths = (char(*)[160])heap_caps_malloc(kBackupMax * 160, MALLOC_CAP_8BIT); }
+  if (!s_backup_disp)  { s_backup_disp  = (char(*)[48]) heap_caps_malloc(kBackupMax * 48,  MALLOC_CAP_SPIRAM);
+                         if (!s_backup_disp)  s_backup_disp  = (char(*)[48]) heap_caps_malloc(kBackupMax * 48,  MALLOC_CAP_8BIT); }
+  return s_backup_paths && s_backup_disp;
+}
 static int       s_backup_count = 0;
 static char      s_backup_chosen[160] = {0};
 
@@ -20292,8 +20453,8 @@ static bool backupIsJson(const char* name) {
   return d && !strcasecmp(d, ".json");
 }
 static void backupAddPath(const char* stored, const char* disp) {
-  const int cap = (int)(sizeof s_backup_paths / sizeof s_backup_paths[0]);
-  if (s_backup_count >= cap) return;
+  if (!backupBufReady()) return;                 // OOM — skip rather than deref a null buffer
+  if (s_backup_count >= kBackupMax) return;
   for (int i = 0; i < s_backup_count; ++i)
     if (!strcmp(s_backup_paths[i], stored)) return;             // dedup
   strncpy(s_backup_paths[s_backup_count], stored, 159); s_backup_paths[s_backup_count][159] = '\0';
@@ -22048,7 +22209,7 @@ static void appTileCb(lv_event_t* e) {
 // so every tile (including Contacts) renders without tofu.
 static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
                        const char* icon, const char* label, int act, int badge,
-                       uint32_t icon_col) {
+                       uint32_t icon_col, bool big = false) {
   // App-style tile: a rounded-square icon chip with the label UNDERNEATH it,
   // instead of a filled box with the text inside. Same grid footprint (w×h);
   // the cell itself is transparent and only shows a faint highlight on press.
@@ -22065,10 +22226,10 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
   // Rounded-square chip (iOS-style squircle), tinted with the app's accent
   // colour, centred up top. Bigger + a small proportional corner radius so it
   // reads as a SQUARE app icon, not a circle.
-  int chip = h - 22;                 // leave one label line beneath
-  if (chip > w - 6) chip = w - 6;
-  if (chip > 58)    chip = 58;
-  if (chip < 30)    chip = 30;
+  int chip = h - (big ? 26 : 22);    // leave one label line beneath (taller in large mode)
+  if (chip > w - 6)         chip = w - 6;
+  if (chip > (big ? 80 : 58)) chip = (big ? 80 : 58);   // higher cap so large-mode chips actually grow
+  if (chip < 30)           chip = 30;
   lv_obj_t* chip_o = lv_obj_create(t);
   lv_obj_remove_style_all(chip_o);
   lv_obj_clear_flag(chip_o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
@@ -22115,7 +22276,13 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
   } else if (icon) {
     lv_obj_t* ic = lv_label_create(chip_o);
     lv_label_set_text(ic, icon);
-    lv_obj_set_style_text_font(ic, &g_font_16, LV_PART_MAIN);
+    // Large mode renders the glyph at 28 px. The two custom FontAwesome glyphs
+    // (person/antenna) only live in g_font_16's fallback chain, so keep those at 16
+    // to avoid a tofu box; every other tile is a standard LVGL/ASCII symbol.
+    const bool custom_glyph = (strcmp(icon, TOUCH_SYM_PERSON) == 0 ||
+                               strcmp(icon, TOUCH_SYM_ANTENNA) == 0);
+    lv_obj_set_style_text_font(ic, (big && !custom_glyph) ? &lv_font_montserrat_28 : &g_font_16,
+                               LV_PART_MAIN);
     lv_obj_set_style_text_color(ic, lv_color_hex(icon_col), LV_PART_MAIN);
     lv_obj_center(ic);
   } else {
@@ -22143,7 +22310,7 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
   lv_obj_set_width(lb, w);
   lv_label_set_long_mode(lb, LV_LABEL_LONG_DOT);        // ellipsize if too wide
   lv_obj_set_style_text_align(lb, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-  lv_obj_set_style_text_font(lb, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_font(lb, big ? &g_font_14 : &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(lb, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_align(lb, LV_ALIGN_BOTTOM_MID, 0, -2);
 
@@ -22165,6 +22332,80 @@ static void addAppTile(lv_obj_t* parent, int x, int y, int w, int h,
     lv_obj_set_style_text_font(bt, &g_font_12, LV_PART_MAIN);
     lv_obj_center(bt);
   }
+}
+
+// ---- App-drawer settings (the cog in the drawer's top-right) ----------------
+static lv_obj_t* s_appgrid_sheet = nullptr;
+static void closeAppGridSheet() {
+  if (s_appgrid_sheet) { lv_obj_del_async(s_appgrid_sheet); s_appgrid_sheet = nullptr; }
+}
+static void appGridBackdropCb(lv_event_t* e) {
+  // Close only on a backdrop tap, not when a child button bubbles its click up.
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED && lv_event_get_target(e) == s_appgrid_sheet)
+    closeAppGridSheet();
+}
+static void appGridChooseCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  const bool large = (bool)(intptr_t)lv_event_get_user_data(e);
+  touchPrefsSetAppGridLarge(large);
+  closeAppGridSheet();
+  // Re-render the drawer in place with the new grid.
+  if (s_appdrawer_root) { lv_obj_del(s_appdrawer_root); s_appdrawer_root = nullptr; }
+  openAppDrawer();
+}
+static void openAppGridSheet() {
+  closeAppGridSheet();
+  lv_coord_t sw = lv_disp_get_hor_res(nullptr), sh = lv_disp_get_ver_res(nullptr);
+  s_appgrid_sheet = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_appgrid_sheet);
+  lv_obj_set_size(s_appgrid_sheet, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_appgrid_sheet, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_appgrid_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_appgrid_sheet, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_appgrid_sheet, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_appgrid_sheet, appGridBackdropCb, LV_EVENT_CLICKED, nullptr);
+
+  const int card_w = 210, btn_h = 46, pad = 12, hdr = 28, gap = 8;
+  lv_obj_t* card = lv_obj_create(s_appgrid_sheet);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, card_w, hdr + 2 * btn_h + gap + 2 * pad);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, pad, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* ttl = lv_label_create(card);
+  lv_label_set_text(ttl, TR("App icon size"));
+  lv_obj_set_style_text_font(ttl, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ttl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(ttl, 0, 0);
+
+  const bool cur = touchPrefsGetAppGridLarge();
+  struct { const char* t; bool large; } opt[2] = { { "Compact", false }, { "Large (bigger icons)", true } };
+  for (int i = 0; i < 2; i++) {
+    lv_obj_t* b = lv_btn_create(card);
+    lv_obj_set_size(b, card_w - 2 * pad, btn_h);
+    lv_obj_set_pos(b, 0, hdr + i * (btn_h + gap));
+    styleButton(b);
+    const bool is_cur = (opt[i].large == cur);
+    lv_obj_add_event_cb(b, appGridChooseCb, LV_EVENT_CLICKED, (void*)(intptr_t)opt[i].large);
+    lv_obj_t* l = lv_label_create(b);
+    // Mark the current choice with a checkmark + accent-coloured text on the normal
+    // (dark) button. Do NOT fill the button with the accent — that left the near-black
+    // text unreadable on a dark accent (the reported bug).
+    char lbl[48];
+    snprintf(lbl, sizeof lbl, "%s%s", is_cur ? LV_SYMBOL_OK "  " : "", TR(opt[i].t));
+    lv_label_set_text(l, lbl);
+    lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(is_cur ? COLOR_ACCENT : COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(l);
+  }
+}
+static void appDrawerSettingsCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openAppGridSheet();
 }
 
 static void openAppDrawer() {
@@ -22219,10 +22460,13 @@ static void openAppDrawer() {
   // tile set). Tile height is sized to fit the rows on screen but CLAMPED to a
   // comfortable [60, 84] px band — so a full app list overflows into the vertical
   // scroll region rather than shrinking the tiles to tiny squares.
+  // Grid size: compact (board default) or LARGE (one fewer column → bigger tiles,
+  // icons + labels, for low vision). Toggled from the app-drawer cog (top-right).
+  const bool big_grid = touchPrefsGetAppGridLarge();
 #if defined(HAS_TDECK_GT911)
-  const int cols = 4;
+  const int cols = big_grid ? 3 : 4;
 #else
-  const int cols = 3;
+  const int cols = big_grid ? 2 : 3;
 #endif
   const int pad = 10, gap = 8, top = 10;
   const int grid_w = sw - 2 * pad;
@@ -22230,15 +22474,15 @@ static void openAppDrawer() {
   const int rows   = (n + cols - 1) / cols;
   const int avail  = (sh - STATUSBAR_H - TABBAR_H) - top - 8;   // content area minus top inset + bottom margin
   int tile_h = (avail - (rows - 1) * gap) / rows;
-  if (tile_h > 84) tile_h = 84;
-  if (tile_h < 54) tile_h = 54;   // floor: overflow scrolls instead of shrinking to tiny tiles
-                                  // (54, not 60, so the V4's 4-row grid fits on screen rather than
-                                  //  clipping the bottom row's label by a few px)
+  const int hi = big_grid ? 116 : 84;   // ceiling
+  const int lo = big_grid ? 78  : 54;   // floor: overflow scrolls instead of shrinking to tiny tiles
+  if (tile_h > hi) tile_h = hi;
+  if (tile_h < lo) tile_h = lo;
   for (int i = 0; i < n; i++) {
     const int col = i % cols, row = i / cols;
     addAppTile(s_appdrawer_root, pad + col * (tile_w + gap), top + row * (tile_h + gap),
                tile_w, tile_h, tiles[i].icon, tiles[i].label, tiles[i].act, tiles[i].badge,
-               tiles[i].color);
+               tiles[i].color, big_grid);
   }
 
   // Keep the scrollbar permanently visible only when the grid actually overflows
@@ -22248,6 +22492,25 @@ static void openAppDrawer() {
   const int visible = sh - STATUSBAR_H - TABBAR_H;
   lv_obj_set_scrollbar_mode(s_appdrawer_root,
                             grid_h > visible ? LV_SCROLLBAR_MODE_ON : LV_SCROLLBAR_MODE_OFF);
+
+  // App-drawer settings cog — top-right, floats above the scrolling grid (does not
+  // move with it). Opens the icon-size chooser (Compact / Large).
+  lv_obj_t* cog = lv_btn_create(s_appdrawer_root);
+  lv_obj_remove_style_all(cog);
+  lv_obj_set_size(cog, 30, 30);
+  lv_obj_add_flag(cog, LV_OBJ_FLAG_FLOATING);
+  lv_obj_align(cog, LV_ALIGN_TOP_RIGHT, -4, 2);
+  lv_obj_set_style_bg_opa(cog, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(cog, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(cog, LV_OPA_20, LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_radius(cog, 15, LV_PART_MAIN);
+  lv_obj_add_event_cb(cog, appDrawerSettingsCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cogl = lv_label_create(cog);
+  lv_label_set_text(cogl, LV_SYMBOL_SETTINGS);
+  lv_obj_set_style_text_font(cogl, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cogl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_center(cogl);
+  lv_obj_move_foreground(cog);
 }
 
 // Status-bar long-hold (3 s) -> full-screen screenshot to /screenshots on SD.
@@ -22558,8 +22821,9 @@ static void updateGlobalStatusBar() {
     lv_obj_set_style_text_font(g_statusbar.left_label, &g_font_12, LV_PART_MAIN);
     int total_unread = g_lv.task->getUnreadTotal();
     if (total_unread > 0) {
-      char buf[64];
-      snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE " %d  %s", total_unread, s_chat_title);
+      char buf[64], ub[8];
+      if (total_unread > 99) snprintf(ub, sizeof ub, "99+"); else snprintf(ub, sizeof ub, "%d", total_unread);
+      snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE " %s  %s", ub, s_chat_title);
       lv_label_set_text(g_statusbar.left_label, buf);
     } else {
       lv_label_set_text(g_statusbar.left_label, s_chat_title);
@@ -22614,7 +22878,8 @@ static void updateGlobalStatusBar() {
       int total_unread = g_lv.task->getUnreadTotal();
       if (total_unread > 0) {
         char buf[24];
-        snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE "  %d", total_unread);
+        if (total_unread > 99) snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE "  99+");
+        else                   snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE "  %d", total_unread);
         lv_label_set_text(g_statusbar.left_label, buf);
       } else {
         // No unread → blank the left zone entirely. Operator complaint was
@@ -25213,6 +25478,14 @@ static File uiDataOpen(const char* name, const char* mode) {
   char p[80]; snprintf(p, sizeof p, "%s%s", s_ui_data_root, name);
   return s_ui_data_fs->open(p, mode);
 }
+// Delete a ui-data file — used to quarantine a blob that fails to load so a
+// corrupt/truncated file (interrupted SD/FAT write, brownout) can't wedge the
+// reader on every boot. The next save rewrites it clean.
+static void uiDataRemove(const char* name) {
+  if (!uiDataFsReady()) return;
+  char p[80]; snprintf(p, sizeof p, "%s%s", s_ui_data_root, name);
+  s_ui_data_fs->remove(p);
+}
 
 // Shared helper: read one on-disk record into a zero-initialized current-layout
 // struct, skipping any surplus tail bytes from a newer (longer) record.
@@ -25233,15 +25506,15 @@ bool UITask::loadThreadsFromStorage() {
   if (f.readBytes(reinterpret_cast<char*>(&hdr), sizeof(hdr)) != static_cast<int>(sizeof(hdr)) ||
       hdr.magic != k_ui_threads_magic ||
       hdr.version < k_ui_history_min_version || hdr.version > k_ui_history_version) {
-    f.close(); return false;
+    f.close(); uiDataRemove(k_ui_threads_path); return false;   // corrupt header — quarantine so it can't wedge every boot
   }
   const size_t disk_sz =
       (hdr.version >= 5 && hdr.thread_rec_size) ? hdr.thread_rec_size : sizeof(UiHistoryThread);
-  if (disk_sz == 0 || disk_sz > 4096) { f.close(); return false; }
+  if (disk_sz == 0 || disk_sz > 4096) { f.close(); uiDataRemove(k_ui_threads_path); return false; }
 
   UiHistoryThread t{};
   for (int i = 0; i < MAX_UI_THREADS; ++i) {
-    if (!readHistoryRec(f, &t, sizeof(t), disk_sz)) { f.close(); return false; }
+    if (!readHistoryRec(f, &t, sizeof(t), disk_sz)) { f.close(); uiDataRemove(k_ui_threads_path); return false; }   // truncated/corrupt record
     _ui_threads[i].used              = t.used != 0;
     _ui_threads[i].channel           = t.channel != 0;
     _ui_threads[i].unread            = t.unread;
@@ -25278,15 +25551,15 @@ bool UITask::loadMsgsFromStorage() {
       hdr.magic != k_ui_msgs_magic ||
       hdr.version < k_ui_history_min_version || hdr.version > k_ui_history_version ||
       hdr.ui_msg_count > MAX_UI_MESSAGES || hdr.ui_msg_head >= MAX_UI_MESSAGES) {
-    f.close(); return false;
+    f.close(); uiDataRemove(k_ui_msgs_path); return false;   // corrupt header — quarantine so it can't crash/wedge every boot
   }
   const size_t disk_sz =
       (hdr.version >= 5 && hdr.msg_rec_size) ? hdr.msg_rec_size : sizeof(UiHistoryMsg);
-  if (disk_sz == 0 || disk_sz > 4096) { f.close(); return false; }
+  if (disk_sz == 0 || disk_sz > 4096) { f.close(); uiDataRemove(k_ui_msgs_path); return false; }
 
   UiHistoryMsg m{};
   for (int i = 0; i < MAX_UI_MESSAGES; ++i) {
-    if (!readHistoryRec(f, &m, sizeof(m), disk_sz)) { f.close(); return false; }
+    if (!readHistoryRec(f, &m, sizeof(m), disk_sz)) { f.close(); uiDataRemove(k_ui_msgs_path); return false; }   // truncated/corrupt record
     _ui_msgs[i].ts        = m.ts;
     _ui_msgs[i].channel   = m.channel != 0;
     _ui_msgs[i].outgoing  = m.outgoing != 0;
@@ -26176,6 +26449,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   if (!s_rawlog_ring) s_rawlog_ring = (char(*)[RXLOG_COLS])heap_caps_calloc(RXLOG_LINES, RXLOG_COLS, MALLOC_CAP_SPIRAM);
   if (!s_rawlog_ring) s_rawlog_ring = (char(*)[RXLOG_COLS])heap_caps_calloc(RXLOG_LINES, RXLOG_COLS, MALLOC_CAP_8BIT);
 #if defined(ESP32)
+  crashDumpCheck();   // detect a pending panic coredump (Settings → About shows an Export button)
   // Bump the CPU above the 80 MHz base-config default. The base was
   // chosen for power on a headless companion build; on a touch device
   // the user is actively interacting and 80 MHz is visibly sluggish on
@@ -26458,9 +26732,18 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
             buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
       }
       if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)malloc(buf_bytes);
+      // Last-ditch under severe DRAM pressure — e.g. a unit whose PSRAM didn't
+      // init (some T-Deck clones are QSPI, not the expected OPI), so even SPIRAM
+      // requests strain the internal heap. A tiny buffer still renders instead of
+      // leaving g_draw_buffer NULL -> NULL-deref in lvglFlush -> boot panic loop.
+      if (!g_draw_buffer) {
+        g_draw_buf_px = 240 * 8;
+        g_draw_buffer = (lv_color_t*)heap_caps_malloc(sizeof(lv_color_t) * g_draw_buf_px,
+                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)malloc(sizeof(lv_color_t) * g_draw_buf_px);
+      }
     }
-    lv_disp_draw_buf_init(&g_lv.draw_buf, g_draw_buffer, nullptr,
-                          240 * LV_DRAW_BUF_LINES);
+    lv_disp_draw_buf_init(&g_lv.draw_buf, g_draw_buffer, nullptr, g_draw_buf_px);
     g_cap_touch_hw_started = false;
     g_lv.touch_inited      = false;
 
@@ -27250,10 +27533,19 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
     in_scope = the_mesh.lastRxScope(&has_scope);
     if (has_scope) meta_flags |= MSG_META_HAS_SCOPE;
   }
+  const int msg_slot = _ui_msg_head;   // appendMessage writes _ui_msgs[head], then advances head
   appendMessage(thread, sender, body, channel, false, true,
                 0 /*ack_hash*/, DELIV_NONE,
                 meta_flags, path_len, snr_q4, rssi,
                 in_path_n ? in_path : nullptr, in_path_n, 0 /*sent_fp*/, in_scope);
+  // Stamp the bubble with the sender's embedded send-time (stashed by MyMesh::
+  // queueMessage) instead of "now" — fixes room-server history replay showing the
+  // whole batch at the delivery time. Only override with a real epoch; live DMs
+  // (embedded ts ≈ now) are unaffected. Consume-once so it never leaks to the next.
+  {
+    uint32_t emb_ts = the_mesh.uiConsumeLastSenderTs();
+    if (emb_ts > 1700000000) _ui_msgs[msg_slot].ts = emb_ts;
+  }
   syncThreadMeshSlots(thread, channel);
 #if defined(HAS_TDECK_GT911)
   // Mirror incoming traffic into the terminal live feed (only while it's open).

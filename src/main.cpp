@@ -399,7 +399,9 @@ void setup() {
    * happens later in loop(); this just inits the stack.) */
   if (want_wifi) {
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(false);
+    WiFi.setAutoReconnect(true);   // let esp_wifi rejoin on its own after a beacon loss / AP reboot
+                                   // (was false — the 10 s poll below was the ONLY recovery, and a
+                                   // bare begin() on a wedged supplicant is a no-op -> never reconnected)
     WiFi.persistent(false);
     // NOTE: do NOT enable modem-sleep here. On a fresh, *unassociated* STA (the
     // setup wizard, no creds yet) DTIM modem-sleep naps the radio through the
@@ -557,6 +559,10 @@ void loop() {
         wifiConfigGetSsid(ssid, sizeof(ssid));
         wifiConfigGetPwd(pwd, sizeof(pwd));
         if (strlen(ssid) > 0) {
+          // A bare begin() on a supplicant wedged after a silent drop (AP reboot /
+          // beacon loss) can be a no-op — clear its state first so this forces a
+          // fresh association. Backs up setAutoReconnect(true) for the stuck case.
+          WiFi.disconnect(false, true);
           WiFi.begin(ssid, pwd[0] ? pwd : nullptr);
         }
       }

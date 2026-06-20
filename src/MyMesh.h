@@ -393,6 +393,7 @@ public:
   uint8_t  _last_rx_path_n  = 0;
   uint16_t _last_rx_scope     = 0;     // transport_codes[0] of the last RX flood ("scope")
   bool     _last_rx_has_scope = false; // false if the packet carried no transport codes
+  uint32_t _last_sender_ts    = 0;     // embedded send-time of the last inbound msg (UI bubble ts; 0 = use now)
   volatile bool _echo_dirty = false;   // a repeat was counted -> UI should refresh
 
   // ---- Live signal strength (top-bar icon) ----
@@ -481,6 +482,10 @@ public:
   /** Scope (transport_codes[0]) of the last received flood; *has = false when
    *  the packet carried no transport codes. */
   uint16_t lastRxScope(bool* has) const { if (has) *has = _last_rx_has_scope; return _last_rx_scope; }
+  /** Consume the embedded send-time stashed right before the last UI notify (room
+   *  history replay carries old send-times; without this the UI stamps "now").
+   *  Returns 0 when nothing was stashed -> the caller keeps the delivery time. */
+  uint32_t uiConsumeLastSenderTs() { uint32_t t = _last_sender_ts; _last_sender_ts = 0; return t; }
   /** Capture route + scope of a just-received flood for the Info popup. Call
    *  synchronously right before the newMsg* notification. */
   void uiStashRxMeta(mesh::Packet* pkt) {

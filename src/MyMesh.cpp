@@ -1880,6 +1880,7 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
     const int8_t rssi   = (int8_t)(_radio->getLastRSSI());
     const bool   is_flood = pkt->isRouteFlood();
     uiStashRxMeta(pkt);   // capture route + scope for the per-message Info popup
+    _last_sender_ts = sender_timestamp;   // embedded send-time -> UI bubble ts (room history replay)
     _ui->newMsgFromPubWithMeta(path_len, is_flood, from.id.pub_key, from.name,
                                text, history_count, snr_q4, rssi);
   }
