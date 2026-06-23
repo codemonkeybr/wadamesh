@@ -19422,12 +19422,21 @@ static inline void crashWdtCaptureRead() {}
 #endif
 
 static void crashDumpCheck() {
+  // The crash-report UI (boot prompt + the About-page export button) is only useful where the
+  // saved file can actually be retrieved and sent to the devs: the T-Deck (SD card) and the
+  // Tanmatsu (FFat, reachable via the launcher's file manager). On the Heltec V4 there's no SD
+  // and no user-reachable internal storage, so the prompt is a dead end — skip detection there
+  // so the whole crash-report UI stays off (everything downstream gates on s_crash_dump_size,
+  // which then stays 0). The panic coredump still sits in its flash partition for a USB/esptool
+  // pull if we ever need it.
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
   crashWdtCaptureRead();   // pull the Task-WDT culprit (if any) before checking for a dump
   size_t addr = 0, size = 0;
   if (esp_core_dump_image_check() == ESP_OK &&
       esp_core_dump_image_get(&addr, &size) == ESP_OK && size > 0 && size < (1u << 20)) {
     s_crash_dump_size = size;
   }
+#endif
 }
 
 // Copy the raw ELF coredump to a file. Prefers SD (T-Deck), falls back to SPIFFS.
