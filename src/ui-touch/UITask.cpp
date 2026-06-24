@@ -2997,6 +2997,7 @@ static volatile int  s_verchk_latest_n = -1;     // highest published pre-alpha_
 static volatile bool s_ota_request = false;      // UI -> worker: download + flash the latest bin
 static volatile int  s_ota_state   = 0;          // 0 idle, 1 running, 2 success, 3 error
 static volatile int  s_ota_pct     = 0;          // download/write progress 0..100
+static volatile int  s_ota_target_n = -1;        // beta_N the worker should fetch (latest, or a chosen older one)
 static char          s_ota_msg[80] = {0};        // error detail surfaced to the UI
 static bool          touchHasOtaUpdateSlot();    // fwd: spare-A/B-slot probe, defined further below
 #endif
@@ -3086,6 +3087,8 @@ static void versionCheckUpdateUi() {
 static lv_obj_t* s_ota_status_lbl = nullptr;   // live OTA status line (About page)
 static lv_obj_t* s_ota_btn        = nullptr;   // "Install update" button (greyed when up to date)
 static lv_obj_t* s_ota_btn_lbl    = nullptr;   // its caption (recoloured when disabled)
+static lv_obj_t* s_ota_prev_btn[3] = {nullptr,nullptr,nullptr};   // "reinstall beta_(latest-k)" buttons (k=1..3)
+static lv_obj_t* s_ota_prev_lbl[3] = {nullptr,nullptr,nullptr};   // their captions
 
 // Enable the OTA button only when an update is actually available — or when the
 // check hasn't completed yet (offline / still checking), so the user isn't
@@ -3107,6 +3110,24 @@ static void otaButtonRefreshState() {
     lv_obj_set_style_bg_color(s_ota_btn, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_ota_btn, LV_OPA_20, LV_PART_MAIN);
     if (s_ota_btn_lbl) lv_obj_set_style_text_color(s_ota_btn_lbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  }
+  // "Reinstall an earlier version" buttons: target beta_(latest-1), -2, -3. Hidden until the
+  // version check yields a latest_n, and only those that map to a real (>=1) beta are shown.
+  for (int k = 1; k <= 3; k++) {
+    lv_obj_t* b = s_ota_prev_btn[k - 1];
+    if (!b) continue;
+    int v = s_verchk_latest_n - k;
+    if (v >= 1) {
+      if (s_ota_prev_lbl[k - 1]) {
+        char pb[24];
+        snprintf(pb, sizeof pb, LV_SYMBOL_DOWNLOAD "  beta_%d", v);
+        lv_label_set_text(s_ota_prev_lbl[k - 1], pb);
+      }
+      lv_obj_set_user_data(b, (void*)(intptr_t)v);
+      lv_obj_clear_flag(b, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
+    }
   }
 }
 
@@ -3140,11 +3161,11 @@ static void otaPollTimerCb(lv_timer_t* t) {
     s_ota_state = 0;
   }
 }
-#endif
 
-static void otaInstallLatestCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
+// Shared OTA kick-off: re-validates (slot present, Wi-Fi up, not already running), pins the
+// target beta_N for the worker, then hands off. Used by both the "Install update" button
+// (target = latest) and the "reinstall an earlier version" buttons (target = a chosen older N).
+static void otaStartInstall(int target_n) {
   if (!touchHasOtaUpdateSlot()) {   // Launcher / no spare slot — the button shouldn't even be here
     if (g_lv.task) g_lv.task->showAlert(TR("Update via the Launcher / flasher.wadamesh.com"), 3000);
     return;
@@ -3157,14 +3178,31 @@ static void otaInstallLatestCb(lv_event_t* e) {
     if (g_lv.task) g_lv.task->showAlert(TR("Wi-Fi not connected"), 2000);
     return;
   }
-  if (s_ota_state == 1) return;   // already running
-  s_ota_msg[0] = 0; s_ota_pct = 0; s_ota_state = 1; s_ota_request = true;   // hand off to the worker
+  if (target_n < 1) return;        // no valid release to fetch
+  if (s_ota_state == 1) return;    // already running
+  s_ota_msg[0] = 0; s_ota_pct = 0; s_ota_target_n = target_n; s_ota_state = 1; s_ota_request = true;   // hand off to the worker
   if (s_ota_btn) { lv_obj_add_state(s_ota_btn, LV_STATE_DISABLED); lv_obj_clear_flag(s_ota_btn, LV_OBJ_FLAG_CLICKABLE); }
   if (s_ota_status_lbl) {
-    lv_label_set_text(s_ota_status_lbl, "Starting update...\nDo not power off.");
+    char sb[48];
+    snprintf(sb, sizeof sb, "Installing beta_%d...\nDo not power off.", target_n);
+    lv_label_set_text(s_ota_status_lbl, sb);
     lv_obj_set_style_text_color(s_ota_status_lbl, lv_color_hex(0xE2A23A), LV_PART_MAIN);
   }
   if (!s_ota_poll_timer) s_ota_poll_timer = lv_timer_create(otaPollTimerCb, 400, nullptr);
+}
+
+// "Reinstall an earlier version" button cb — the chosen beta_N is stashed in the button user data.
+static void otaPrevPickCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int v = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  if (v >= 1) otaStartInstall(v);
+}
+#endif
+
+static void otaInstallLatestCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
+  otaStartInstall(s_verchk_latest_n);
 #else
   // Launcher / Tanmatsu: no spare OTA slot to write into — update out-of-band.
   if (s_ota_status_lbl) {
@@ -17113,7 +17151,7 @@ static void otaWorkerRun(WiFiClient& client, HTTPClient& http) {
   s_ota_pct = 0;
   char url[176];
   snprintf(url, sizeof url, "http://firmware.wadamesh.com/releases/TOUCH/beta_%d/%s.bin",
-           s_verchk_latest_n, OTA_BIN_NAME);
+           s_ota_target_n, OTA_BIN_NAME);
   http.setReuse(false);
   http.setConnectTimeout(8000);
   http.setTimeout(20000);
@@ -20546,6 +20584,34 @@ static void settingsCatBuild(int cat) {
         lv_obj_center(s_ota_btn_lbl);
         otaButtonRefreshState();   // grey immediately if we already know we're current
 
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
+        // "Reinstall an earlier version" — the 3 betas just below the latest. Subtler than the
+        // green Install button; labels/visibility are set by otaButtonRefreshState() once the
+        // version check yields a latest_n (and refreshed again immediately below if already known).
+        {
+          lv_obj_t* prev_hint = lv_label_create(page);
+          lv_obj_set_style_text_font(prev_hint, &g_font_12, LV_PART_MAIN);
+          lv_obj_set_style_text_color(prev_hint, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+          lv_label_set_text(prev_hint, "Reinstall an earlier version:");
+        }
+        for (int k = 0; k < 3; k++) {
+          lv_obj_t* b = lv_btn_create(page);
+          lv_obj_set_size(b, lblw, 32);
+          styleButton(b);
+          lv_obj_set_style_bg_color(b, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+          lv_obj_add_event_cb(b, otaPrevPickCb, LV_EVENT_CLICKED, nullptr);
+          lv_obj_t* l = lv_label_create(b);
+          lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+          lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+          lv_label_set_text(l, "");
+          lv_obj_center(l);
+          lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);   // shown by otaButtonRefreshState() if it maps to a real beta
+          s_ota_prev_btn[k] = b;
+          s_ota_prev_lbl[k] = l;
+        }
+        otaButtonRefreshState();   // label + reveal the prev buttons if latest_n is already known
+#endif
+
         s_ota_status_lbl = lv_label_create(page);
         lv_label_set_long_mode(s_ota_status_lbl, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(s_ota_status_lbl, lblw);
@@ -20608,6 +20674,7 @@ static void closeSettingsCategory() {
   if (s_settings_open_cat == CAT_ABOUT) {   // null the live-label ptrs (freed with the sheet)
     s_sysinfo_lbl = nullptr; s_update_about_lbl = nullptr; s_ota_status_lbl = nullptr;
     s_ota_btn = nullptr; s_ota_btn_lbl = nullptr;
+    for (int k = 0; k < 3; k++) { s_ota_prev_btn[k] = nullptr; s_ota_prev_lbl[k] = nullptr; }
     g_lv.settings_status = nullptr; g_lv.diag_id_label = nullptr; g_lv.diag_label = nullptr;
   }
 #if defined(HAS_TDECK_GT911)
