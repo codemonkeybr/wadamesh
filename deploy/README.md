@@ -3,11 +3,24 @@
 Distribution stack for wadamesh: a **VPS nginx origin behind Cloudflare**.
 
 ```
-tiles.wadamesh.com     →CF (HTTP, edge-cached) →  nginx → tile.openstreetmap.org
+tiles.wadamesh.com     →CF (HTTP, edge-cached) →  nginx → OpenStreetMap / OpenTopoMap
 firmware.wadamesh.com  →CF (cache bins)        →  nginx → /srv/wadamesh/firmware
 flasher.wadamesh.com   →CF (HTTPS)             →  web flasher        (TODO — see below)
 wadamesh.com           →CF (HTTPS)             →  landing page       (later)
 ```
+
+**Map tile styles.** The default `/{z}/{x}/{y}.jpg` route serves **OpenStreetMap**
+(the firmware default). An opt-in **OpenTopoMap** topographic style is served from
+`/opentopo/{z}/{x}/{y}.jpg` (explicit OSM alias at `/osm/...`); the device requests
+it only when the user enables *Map → Options → Topographic map*. Legal: OpenTopoMap
+map tiles are **© OpenTopoMap (CC-BY-SA)** over **© OpenStreetMap contributors
+(ODbL) + SRTM** — the touch UI shows that attribution when topo is active, and the
+14-day disk cache keeps each tile hitting OpenTopoMap at most once per fortnight
+(their tile-usage policy asks for a contactable UA + caching, both of which the
+transcode service provides). Deploying the topo routes = update
+`tiles.wadamesh.com.conf` + `tile-transcode.py`, then
+`systemctl restart wadamesh-tile-transcode && nginx -t && systemctl reload nginx`
+and purge the Cloudflare cache for `tiles.wadamesh.com/opentopo/*`.
 
 The firmware fetches **tiles + the update-check over plain HTTP** (on-device HTTPS
 isn't viable — mbedTLS needs ~30 KB heap, only ~5 KB is free post-Wi-Fi), so the

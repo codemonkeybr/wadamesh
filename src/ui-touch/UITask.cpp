@@ -7862,6 +7862,16 @@ static bool s_tiles_from_sd = false;
 // never altered). Loaded from prefs at boot; toggled in the map options popup.
 static bool s_map_night = false;
 
+// Map tile style: 0 = OpenStreetMap (default), 1 = OpenTopoMap (topographic relief).
+// Loaded from prefs at boot; toggled in the map options popup. Topo is namespaced
+// in the on-disk cache (/tiles/topo) and fetched via the proxy's /opentopo route,
+// so the OSM and topo caches never collide and toggling is instant for tiles that
+// are already cached. SD map packs are OSM-only, so topo always uses the online
+// cache + fetch (see loadTileJpeg / queueTileForFetch).
+static uint8_t s_map_style = 0;
+static inline const char* mapTileRoot()    { return s_map_style == 1 ? "/tiles/topo" : "/tiles"; }   // on-disk cache root
+static inline const char* mapTileUrlPath() { return s_map_style == 1 ? "/opentopo"   : ""; }         // proxy route segment
+
 // Distance units toggle (km <-> miles). Applies immediately — saves the
 // pref and forces the contacts list to re-render its distance badges.
 #if defined(HAS_TDECK_GT911)
@@ -17902,14 +17912,16 @@ worldPxToLatLon(double world_x, double world_y, uint8_t zoom,
 // so the LVGL thread on core 1 isn't blocked by network I/O. Self-
 // terminates after a 5 s idle period to release the stack.
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
-static void ensureTilesDirPath(uint8_t z, int32_t x) {
-  // LittleFS requires explicit mkdir; opening a deep path won't auto-
-  // create the parents.
-  char p[40];
+static void ensureTilesDirPath(uint8_t z, int32_t x, const char* root) {
+  // LittleFS requires explicit mkdir; opening a deep path won't auto-create the
+  // parents. `root` is /tiles (OSM) or /tiles/topo (OpenTopoMap) — for topo the
+  // /tiles parent must exist before /tiles/topo can be made.
+  char p[48];
   snprintf(p, sizeof(p), "/tiles");                       tileCacheMkdir(p);
-  snprintf(p, sizeof(p), "/tiles/%u", (unsigned)z);        tileCacheMkdir(p);
-  snprintf(p, sizeof(p), "/tiles/%u/%ld",
-           (unsigned)z, (long)x);                          tileCacheMkdir(p);
+  snprintf(p, sizeof(p), "%s", root);                     tileCacheMkdir(p);
+  snprintf(p, sizeof(p), "%s/%u", root, (unsigned)z);     tileCacheMkdir(p);
+  snprintf(p, sizeof(p), "%s/%u/%ld",
+           root, (unsigned)z, (long)x);                   tileCacheMkdir(p);
 }
 
 // ----- Firmware version check (reuses the core-0 fetch worker) -----
@@ -18173,14 +18185,19 @@ static void tileFetchTaskFn(void* arg) {
       continue;
     }
 
+    // Capture the active map style ONCE per fetch so the cache path and the
+    // upstream URL can't disagree if the user toggles topo mid-download (both
+    // pointers are static string literals, so they stay valid).
+    const char* froot = mapTileRoot();      // /tiles or /tiles/topo
+    const char* fseg  = mapTileUrlPath();   // "" or /opentopo
     // Skip if we already have the JPEG. A stale .png (from an earlier
     // build that fetched PNGs) is deleted and re-fetched as .jpg, since
     // the device can't decode PNG.
     char path_jpg[48], path_png[48];
     snprintf(path_jpg, sizeof(path_jpg),
-             "/tiles/%u/%ld/%ld.jpg", (unsigned)req.z, (long)req.x, (long)req.y);
+             "%s/%u/%ld/%ld.jpg", froot, (unsigned)req.z, (long)req.x, (long)req.y);
     snprintf(path_png, sizeof(path_png),
-             "/tiles/%u/%ld/%ld.png", (unsigned)req.z, (long)req.x, (long)req.y);
+             "%s/%u/%ld/%ld.png", froot, (unsigned)req.z, (long)req.x, (long)req.y);
     if (tileCacheExists(path_jpg)) {
       // Validate it's actually a JPEG. An older build — or a proxy/OSM error
       // response cached as a .jpg — leaves a non-image that renders as a BLACK
@@ -18245,7 +18262,7 @@ static void tileFetchTaskFn(void* arg) {
       continue;
     }
 
-    ensureTilesDirPath(req.z, req.x);
+    ensureTilesDirPath(req.z, req.x, froot);
 
     char base[TOUCH_TILE_SERVER_MAXLEN];
     touchPrefsGetTileServer(base, sizeof(base));
@@ -18258,8 +18275,8 @@ static void tileFetchTaskFn(void* arg) {
     // direct) instead of lodepng (full 256 KB ARGB8888 decode per tile,
     // which both rendered as noise and bogged the UI down).
     char url[160];
-    snprintf(url, sizeof(url), "%s/%u/%ld/%ld.jpg",
-             base, (unsigned)req.z, (long)req.x, (long)req.y);
+    snprintf(url, sizeof(url), "%s%s/%u/%ld/%ld.jpg",
+             base, fseg, (unsigned)req.z, (long)req.x, (long)req.y);
     http.begin(client, url);
     // Bound the network waits BELOW the 5 s task-watchdog timeout. HTTPClient's
     // default TCP timeout is 5 s — identical to the WDT — so a single stalled
@@ -18447,10 +18464,12 @@ static void queueTileForFetch(uint8_t z, int32_t x, int32_t y) {
   // SD-backed cache, stay read-only/offline as before. (WiFi-down guard below still
   // keeps it fully offline when there's no link.) SD exists only on the T-Deck build;
   // elsewhere s_tiles_from_sd is always false, so the simple guard is equivalent.
+  // The SD-pack offline mode is OSM-only; topo has no SD packs, so it always
+  // fetches from the proxy regardless of the microSD-tiles setting.
 #if defined(HAS_TDECK_GT911)
-  if (s_tiles_from_sd && s_tile_fs != &SD) return;
+  if (s_map_style == 0 && s_tiles_from_sd && s_tile_fs != &SD) return;
 #else
-  if (s_tiles_from_sd) return;
+  if (s_map_style == 0 && s_tiles_from_sd) return;
 #endif
   if (WiFi.status() != WL_CONNECTED) return;
   if (tileFetchSeen(z, x, y)) return;
@@ -18566,10 +18585,10 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
   // renderMapTiles sniffs the magic bytes and routes to the right decoder, so both formats
   // render on the SD path; the LittleFS cache is JPEG-only by design (see above).
   char path[48];
-  snprintf(path, sizeof(path), "/tiles/%u/%ld/%ld.jpg",
-           (unsigned)z, (long)x, (long)y);
+  snprintf(path, sizeof(path), "%s/%u/%ld/%ld.jpg",
+           mapTileRoot(), (unsigned)z, (long)x, (long)y);
 #if defined(HAS_TDECK_GT911)
-  if (s_tiles_from_sd) {
+  if (s_tiles_from_sd && s_map_style == 0) {   // SD packs are OSM-only; topo uses the online /tiles/topo cache
     // Tile source = microSD: read straight off the card (fully offline, no server fetch).
     if (!fmSdTryMount()) return false;
     markSdIo();                          // SD read activity -> status-bar LED
@@ -18659,7 +18678,7 @@ static bool mapTileSourceReady() {
 // drew its tiles but the buttons reported "Max/Min zoom for this pack" offline.
 static bool tileExistsAt(uint8_t z, long x, long y) {
 #if defined(HAS_TDECK_GT911)
-  if (s_tiles_from_sd) {
+  if (s_tiles_from_sd && s_map_style == 0) {   // topo isn't on SD packs — probe the online cache below
     if (!fmSdTryMount()) return false;
     char p[56];
     snprintf(p, sizeof p, "/maps/osm/%u/%ld/%ld.png", (unsigned)z, x, y);
@@ -18676,9 +18695,9 @@ static bool tileExistsAt(uint8_t z, long x, long y) {
 #endif
   if (!s_tiles_fs_ready) return false;
   char p[48];
-  snprintf(p, sizeof p, "/tiles/%u/%ld/%ld.jpg", (unsigned)z, x, y);
+  snprintf(p, sizeof p, "%s/%u/%ld/%ld.jpg", mapTileRoot(), (unsigned)z, x, y);
   if (tileCacheExists(p)) return true;
-  snprintf(p, sizeof p, "/tiles/%u/%ld/%ld.png", (unsigned)z, x, y);
+  snprintf(p, sizeof p, "%s/%u/%ld/%ld.png", mapTileRoot(), (unsigned)z, x, y);
   return tileCacheExists(p);
 }
 #endif  // ESP32
@@ -19541,7 +19560,30 @@ static void mapOptLinesCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   lv_obj_t* sw = lv_event_get_target(e);
   s_map_show_links = lv_obj_has_state(sw, LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetMapShowLinks(s_map_show_links);   // persist across reboots (PR #61)
+#endif
   renderMapMarkers();   // rebuild links to reflect the new state
+}
+
+// Topographic map style (OpenTopoMap) toggle — opt-in; default OFF (OpenStreetMap).
+// Switches the tile source: topo tiles cache under /tiles/topo and fetch via the
+// proxy's /opentopo route. Clears the (z,x,y) fetch-dedup ring — it's shared across
+// styles — so the newly-selected style re-queues, then re-renders. applyMapChrome
+// refreshes the on-map © attribution (OSM vs OpenTopoMap).
+static void mapOptTopoCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool topo = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  s_map_style = topo ? 1 : 0;
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  touchPrefsSetMapStyle(s_map_style);
+  memset(s_tile_fetch_dedup, 0, sizeof(s_tile_fetch_dedup));   // shared (z,x,y) ring → forget so the new style re-fetches
+  s_tile_fetch_dedup_head = 0;
+#endif
+  freeMapTiles();        // drop in-RAM decodes; next render reads the new style's cache dir
+  renderMapTiles();      // loads /tiles/topo (cached) or queues a fetch via /opentopo
+  renderMapMarkers();
+  applyMapChrome(true);  // refresh the © attribution for the new style
 }
 
 // "Night mode" switch — invert tile colours at render time. Re-decodes the
@@ -19729,20 +19771,27 @@ static void mapOptInfoCb(lv_event_t* e) {
   lv_obj_set_pos(lbl, 0, 28);
   lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-  lv_label_set_text(lbl,
-    "Map data \xC2\xA9 OpenStreetMap contributors.\n"
-    "openstreetmap.org/copyright\n"
-    "Licensed under the Open Database License (ODbL).\n\n"
+  // Attribution header is style-dependent (legal requirement). OpenTopoMap's map
+  // style is CC-BY-SA and must be credited; its underlying data is still OSM+SRTM.
+  const char* attrib = (s_map_style == 1)
+    ? "Map style \xC2\xA9 OpenTopoMap (CC-BY-SA) \xE2\x80\x94 opentopomap.org\n"
+      "Map data \xC2\xA9 OpenStreetMap contributors (ODbL) + SRTM.\n\n"
+    : "Map data \xC2\xA9 OpenStreetMap contributors.\n"
+      "openstreetmap.org/copyright\n"
+      "Licensed under the Open Database License (ODbL).\n\n";
+  static char credits[820];
+  snprintf(credits, sizeof(credits), "%s%s", attrib,
     "How tiles work:\n"
     "The map is built from 256\xC3\x97256 \"slippy\" tiles. Only the tiles for the "
     "area you're viewing are fetched \xE2\x80\x94 there is no bulk pre-download.\n\n"
     "Because this device can't do HTTPS (not enough heap after Wi-Fi starts) "
-    "and decodes JPEG far more cheaply than PNG, tiles come from the meshcomod "
-    "proxy: it fetches the PNG from OpenStreetMap over HTTPS with an identifying "
+    "and decodes JPEG far more cheaply than PNG, tiles come from the wadamesh "
+    "proxy: it fetches the upstream PNG over HTTPS with an identifying "
     "User-Agent, re-encodes it as JPEG, and caches it. Your device then caches "
     "each tile to its own flash, so a tile is only downloaded once.\n\n"
     "Use Options \xE2\x86\x92 Reload tiles to re-download the tiles currently in "
     "view if one looks corrupted.");
+  lv_label_set_text(lbl, credits);
 }
 
 // Open the options popup: a compact bottom-anchored card with the Lines switch
@@ -19795,6 +19844,20 @@ static void openMapOptions() {
     y += 40;
   }
 #endif
+
+  // Row: Topographic map (OpenTopoMap) — opt-in alternate tile style; default OSM.
+  {
+    lv_obj_t* tpl = lv_label_create(card);
+    lv_label_set_text(tpl, TR("Topographic map"));
+    lv_obj_set_style_text_color(tpl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(tpl, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_pos(tpl, 2, y + 4);
+    lv_obj_t* sw_topo = lv_switch_create(card);
+    lv_obj_align(sw_topo, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (s_map_style == 1) lv_obj_add_state(sw_topo, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw_topo, mapOptTopoCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += 40;
+  }
 
   // Row: Night mode (invert tile colours) — a tile/display setting, kept up top.
   {
@@ -27174,7 +27237,9 @@ static void updateGlobalStatusBar() {
                                tab == MAP_TAB_INDEX ? &g_font_12 : &g_font_14, LV_PART_MAIN);
     if (tab == MAP_TAB_INDEX) {
       // On the immersive map the left zone carries the required OSM attribution.
-      lv_label_set_text(g_statusbar.left_label, TR("\xC2\xA9 OpenStreetMap"));
+      lv_label_set_text(g_statusbar.left_label, s_map_style == 1
+          ? TR("\xC2\xA9 OpenTopoMap")      // © OpenTopoMap (CC-BY-SA) — full text in Options -> Info
+          : TR("\xC2\xA9 OpenStreetMap"));
     } else if (tab == HOME_TAB_INDEX && touchPrefsGetHideNodeName()) {
       // Display setting: hide the device name. Clear the left zone — the clock is
       // parked here instead (see the clock-placement block below).
@@ -31501,6 +31566,8 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   s_map_show_coords   = touchPrefsGetMapShowCoords();     // per-element map text/marker visibility
   s_map_show_tilexyz  = touchPrefsGetMapShowTileXYZ();
   s_map_show_contacts = touchPrefsGetMapShowContacts();
+  s_map_show_links    = touchPrefsGetMapShowLinks();      // dotted self->contact link lines (PR #61)
+  s_map_style         = touchPrefsGetMapStyle();          // 0=OpenStreetMap (default), 1=OpenTopoMap
   { const uint8_t pz = touchPrefsGetMapZoom();    // restore the last user-set map zoom
     if (pz >= k_map_zoom_min && pz <= k_map_zoom_max) s_map_zoom = pz; }
   s_map_zoom_buttons = touchPrefsGetMapZoomButtons();   // map zoom control: slider (default) vs +/- buttons

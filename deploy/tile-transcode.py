@@ -39,8 +39,17 @@ except ImportError:
     sys.exit("ERROR: pip install flask pillow requests")
 
 OSM_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-# OSM tile policy: identify yourself with a contactable UA. This is what OSM
-# sees — the device never talks to OSM directly.
+# OpenTopoMap (topographic / terrain-relief style) — an OPT-IN alternate style.
+# The firmware default stays OpenStreetMap; the device only requests /opentopo/
+# when the user enables it. Like OSM it serves PNG, so it goes through the same
+# fetch+transcode path. Legal: map style © OpenTopoMap (CC-BY-SA), underlying
+# data © OpenStreetMap contributors (ODbL) + SRTM — the touch UI shows that
+# attribution whenever topo is the selected style. OpenTopoMap's tile-usage
+# policy asks for a contactable User-Agent + caching; nginx caches results 14
+# days so each unique tile hits OpenTopoMap at most once per fortnight.
+OPENTOPO_URL = "https://tile.opentopomap.org/{z}/{x}/{y}.png"
+# Tile policy: identify yourself with a contactable UA. This is what the upstream
+# tile servers see — the device never talks to them directly.
 OSM_UA = "wadamesh-tile-proxy/1.0 (+https://wadamesh.com)"
 JPEG_QUALITY = 80          # slippy tiles compress well; 80 ≈ visually lossless
 MAX_TILE_BYTES = 256 * 1024
@@ -57,38 +66,54 @@ _session = requests.Session()
 _session.headers.update({"User-Agent": OSM_UA, "Accept": "image/png,image/*"})
 
 
-@app.get("/<int:z>/<int:x>/<int:y>.jpg")
-def tile(z: int, x: int, y: int):
-    # Range-check before touching OSM so we can't be turned into an open proxy.
+def _fetch_tile_png(upstream_url: str, z: int, x: int, y: int) -> bytes:
+    # Range-check before touching the upstream so we can't be turned into an open proxy.
     if not (0 <= z <= 19):
         abort(404)
     n = 1 << z
     if not (0 <= x < n and 0 <= y < n):
         abort(404)
-
     try:
-        r = _session.get(OSM_URL.format(z=z, x=x, y=y), timeout=REQUEST_TIMEOUT,
+        r = _session.get(upstream_url.format(z=z, x=x, y=y), timeout=REQUEST_TIMEOUT,
                          stream=True)
     except requests.RequestException:
         abort(502)
-
     if r.status_code != 200:
-        # Pass OSM's status through (404 = empty/sea tile — nginx caches it).
+        # Pass the upstream status through (404 = empty/sea tile — nginx caches it).
         abort(r.status_code if r.status_code in (404, 429) else 502)
-
     raw = r.raw.read(MAX_TILE_BYTES + 1, decode_content=True)
     if len(raw) > MAX_TILE_BYTES:
         abort(502)
+    return raw
 
+
+def _tile_response_from_png(raw: bytes) -> Response:
     try:
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         out = io.BytesIO()
         img.save(out, "JPEG", quality=JPEG_QUALITY, optimize=True)
     except Exception:
         abort(502)
-
     return Response(out.getvalue(), mimetype="image/jpeg",
                     headers={"Cache-Control": "public, max-age=2592000"})
+
+
+# Default path the firmware uses → OpenStreetMap (the shipping default style).
+@app.get("/<int:z>/<int:x>/<int:y>.jpg")
+def tile(z: int, x: int, y: int):
+    return _tile_response_from_png(_fetch_tile_png(OSM_URL, z, x, y))
+
+
+# Explicit OpenStreetMap alias (identical to the root path).
+@app.get("/osm/<int:z>/<int:x>/<int:y>.jpg")
+def tile_osm(z: int, x: int, y: int):
+    return _tile_response_from_png(_fetch_tile_png(OSM_URL, z, x, y))
+
+
+# OpenTopoMap (topographic) — opt-in alternate style selected on the device.
+@app.get("/opentopo/<int:z>/<int:x>/<int:y>.jpg")
+def tile_opentopo(z: int, x: int, y: int):
+    return _tile_response_from_png(_fetch_tile_png(OPENTOPO_URL, z, x, y))
 
 
 @app.get("/elev")

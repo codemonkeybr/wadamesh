@@ -98,6 +98,12 @@ bool touchPrefsGetMapShowTileXYZ();
 bool touchPrefsSetMapShowTileXYZ(bool on);
 bool touchPrefsGetMapShowContacts();
 bool touchPrefsSetMapShowContacts(bool on);
+bool touchPrefsGetMapShowLinks();
+bool touchPrefsSetMapShowLinks(bool on);
+
+/** Map tile style: 0 = OpenStreetMap (default), 1 = OpenTopoMap (topographic, opt-in). */
+uint8_t touchPrefsGetMapStyle();
+bool    touchPrefsSetMapStyle(uint8_t style);
 
 /* App drawer: large grid (one fewer column → bigger icons + labels, for low vision).
  * Default false = the compact grid (T-Deck 4 cols / Heltec V4 3 cols). */
