@@ -6762,10 +6762,21 @@ static void openDiscoveredModalCb(lv_event_t* e) {
       lv_label_set_text(cl, LV_SYMBOL_SETTINGS);
       lv_obj_set_style_text_color(cl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
       lv_obj_center(cl);
+      // Sort (⇅) — opens the discovered sort sheet (Recently heard / Name / Nearest,
+      // each asc/desc). Always present so the control is visible even on an empty list.
+      lv_obj_t* srt = lv_btn_create(header);
+      lv_obj_set_size(srt, SC(32), SC(32));
+      lv_obj_align(srt, LV_ALIGN_RIGHT_MID, -106, 0);   // left of the cog
+      styleButton(srt);
+      lv_obj_add_event_cb(srt, openDiscSortSheetCb, LV_EVENT_CLICKED, nullptr);
+      lv_obj_t* srtl = lv_label_create(srt);
+      lv_label_set_text(srtl, LV_SYMBOL_SHUFFLE);
+      lv_obj_set_style_text_color(srtl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+      lv_obj_center(srtl);
       if (n > 0) {
         lv_obj_t* pb = lv_btn_create(header);
         lv_obj_set_size(pb, SC(32), SC(32));
-        lv_obj_align(pb, LV_ALIGN_RIGHT_MID, -106, 0);   // left of the cog
+        lv_obj_align(pb, LV_ALIGN_RIGHT_MID, -144, 0);   // left of the sort
         styleButton(pb);
         lv_obj_set_style_bg_color(pb, lv_color_hex(0x7A2A2A), LV_PART_MAIN);
         lv_obj_add_event_cb(pb, discoveredPurgeCb, LV_EVENT_CLICKED, nullptr);
@@ -6789,24 +6800,6 @@ static void openDiscoveredModalCb(lv_event_t* e) {
       "Anything heard over the air that isn't in your contacts will show up "
       "here. When auto-add is off, you can manually add nodes to your contacts.");
     return;
-  }
-
-  // Sort control — opens a small sheet (mirrors the Contacts sort). Tapping the
-  // active option again flips ascending/descending; the arrow shows the direction.
-  {
-    lv_obj_t* sb = lv_btn_create(body);
-    lv_obj_set_size(sb, s_settings_content_w, SC(28));
-    lv_obj_set_pos(sb, 0, y);
-    styleButton(sb);
-    lv_obj_add_event_cb(sb, openDiscSortSheetCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* sl = lv_label_create(sb);
-    lv_label_set_text_fmt(sl, "%s  %s  %s", LV_SYMBOL_SHUFFLE,
-                          TR(discSortOptName(g_disc_sort)),
-                          g_disc_sort_desc ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
-    lv_obj_set_style_text_color(sl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-    lv_obj_set_style_text_font(sl, &g_font_14, LV_PART_MAIN);
-    lv_obj_center(sl);
-    y += SC(34);
   }
 
   for (int k = 0; k < n; ++k) {
