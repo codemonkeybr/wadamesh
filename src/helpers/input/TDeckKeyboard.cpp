@@ -26,7 +26,12 @@ void tdeckKeyboardBegin() {
 }
 
 void tdeckKeyboardSetBacklight(uint8_t level) {
-  if (level != s_bl_desired) { s_bl_desired = level; s_bl_dirty = true; }
+  // Force the FIRST write even when the requested level matches our cached default (0). A reflash
+  // resets the ESP32 but NOT the keyboard's C3 — it keeps its previously-lit backlight — so without
+  // this the boot "off" request (0 == cached 0) was never sent and the backlight stayed on despite
+  // the setting reading "Off" (issue #33). After the first write, change-detection resumes.
+  static bool forced = false;
+  if (level != s_bl_desired || !forced) { s_bl_desired = level; s_bl_dirty = true; forced = true; }
 }
 
 void tdeckKeyboardPoll() {

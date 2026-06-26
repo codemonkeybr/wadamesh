@@ -113,6 +113,10 @@ private:
    * unlock from this state, only another BOOT button press. False = the
    * screen turned off from idle timeout, in which case touch wakes it. */
   bool _manual_lock;
+  // Burn-in guard for the lit lock screen (#55): stamped when the lock screen goes from off->lit;
+  // the loop dims a hard-locked LIT panel a bounded time after this, independent of the screen-timeout
+  // setting and of held/ghost touches that keep re-revealing it. 0 = not currently lit-locked.
+  uint32_t _lock_lit_ms = 0;
   NodePrefs* _node_prefs;
   // GPS auto-location: once a fix is seen, keep the node location (node_lat/lon,
   // used by the profile + adverts) synced to GPS and persist it occasionally

@@ -32506,13 +32506,17 @@ void UITask::lockScreen() {
   // T-Deck: build the lock screen overlay now (dark). A key/trackball press
   // reveals it; holding the trackball unlocks. (V4 keeps the plain off+wake.)
   lockscreenShow();
+  _lock_lit_ms = millis();   // arm the burn-in guard so a lit lock screen always dims (#55)
 #endif
 }
 
 void UITask::lockscreenReveal() {
 #if defined(HAS_TDECK_GT911)
   if (!_manual_lock) return;                 // only meaningful while hard-locked
-  if (_screen_off) { setCpuForScreen(true); touchScreenBacklight(true); _screen_off = false; }
+  if (_screen_off) {
+    setCpuForScreen(true); touchScreenBacklight(true); _screen_off = false;
+    _lock_lit_ms = millis();                 // re-arm the burn-in timer ONLY on a real off->lit reveal,
+  }                                          // so a held / ghost touch can't keep the panel lit forever
   lockscreenShow();                          // ensure built + on top
   _last_input_ms = millis();                 // restart the re-dim timer
 #endif
@@ -32985,6 +32989,21 @@ void UITask::loop() {
       _screen_off = true;
     }
   }
+
+#if defined(HAS_TDECK_GT911)
+  // Burn-in guard (#55): a LIT hard-locked panel ALWAYS dims after a bounded window — independent of
+  // the screen-timeout setting (which may be "never") and of held / ghost touches that keep re-revealing
+  // the lock screen. _lock_lit_ms is re-armed only on a real off->lit transition (lock / reveal), so it
+  // can't be pushed out forever; a deliberate reveal re-lights it and it dims again shortly after.
+  if (_manual_lock && !_screen_off && _lock_lit_ms) {
+    uint32_t lock_dim = (_screen_timeout_ms > 0 && _screen_timeout_ms < 20000u) ? _screen_timeout_ms : 20000u;
+    if ((int32_t)(now - _lock_lit_ms) >= (int32_t)lock_dim) {
+      touchScreenBacklight(false);
+      setCpuForScreen(false);
+      _screen_off = true;
+    }
+  }
+#endif
 
 #if defined(HAS_TOUCH_UI)
   if (!g_lv.ready) return;
