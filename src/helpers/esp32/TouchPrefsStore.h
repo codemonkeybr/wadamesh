@@ -148,6 +148,11 @@ bool    touchPrefsSetFemLna(bool on);
 bool    touchPrefsGetMsgFlash();
 bool    touchPrefsSetMsgFlash(bool on);
 
+/* Advertise on boot (#76): fire one flood self-advert ~6s after boot so peers with auto-add on
+ * refresh our pubkey (useful after a reflash wiped storage). Opt-in, default off. All boards. */
+bool    touchPrefsGetBootAdvert();
+bool    touchPrefsSetBootAdvert(bool on);
+
 /* Periodic self-advert intervals (the standard MeshCore flood/local advert, on a timer). 0 = off.
  * Flood in hours; local zero-hop in minutes (0 or 60-240). Scheduled in UITask::loop via sendAdvert. */
 uint16_t touchPrefsGetFloodAdvHrs();

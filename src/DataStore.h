@@ -45,6 +45,10 @@ public:
 #endif
   FILESYSTEM* getPrimaryFS() const { return _fs; }
   FILESYSTEM* getSecondaryFS() const { return _fsExtra; }
+  // Route contacts + channels (see _getContactsChannelsFS) to a different FS than identity/prefs.
+  // Used on the Tanmatsu to keep identity/prefs on the (working) internal FFat while putting the
+  // frequently-rewritten contacts/channels on the reliable SD card. Call before begin().
+  void setSecondaryFS(FILESYSTEM* fs) { _fsExtra = fs; }
   bool loadMainIdentity(mesh::LocalIdentity &identity);
   bool saveMainIdentity(const mesh::LocalIdentity &identity);
   void loadPrefs(NodePrefs& prefs, double& node_lat, double& node_lon);

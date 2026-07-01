@@ -882,6 +882,13 @@ constexpr int TAB_LAST               = 4;
 // otherwise get focused and painted solid by the focus highlight (white over the map).
 #define NAV_SKIP_FLAG LV_OBJ_FLAG_USER_1
 
+// A "horizontal-only" secondary keyboard-nav target (e.g. the per-row settings gear in the chat
+// list): UP/DOWN skip it so vertical nav walks the primary rows, RIGHT/LEFT reach it, and — the
+// key part — it does NOT suppress its parent row from being harvested. Without this, navCollect's
+// leaf rule (a clickable with a clickable child is treated as a container) picks the gear over the
+// row, leaving the row un-focusable so keyboard users could only open thread-settings, never the chat.
+#define NAV_HMOVE_FLAG LV_OBJ_FLAG_USER_2
+
 // ---- Chat overlay layout ----
 constexpr int CHAT_HDR_H       = 0;    // in-chat header bar removed; thread name shows in the status bar
 #if CAP_LARGE_SCREEN
@@ -2480,6 +2487,9 @@ static void navMoveDir(int dir) {
   for (int i = 0; i < n; i++) {
     lv_obj_t* o = s_nav_objs[i];
     if (!o || o == cur || !lv_obj_is_valid(o) || lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) continue;
+    // Horizontal-only secondary targets (chat-row gears) are reachable by LEFT/RIGHT only, so
+    // UP/DOWN walk the primary rows instead of hopping onto a gear.
+    if ((dir == NAV_UP || dir == NAV_DOWN) && lv_obj_has_flag(o, NAV_HMOVE_FLAG)) continue;
     lv_area_t b; lv_obj_get_coords(o, &b);
     const int dx = (b.x1 + b.x2) / 2 - cx, dy = (b.y1 + b.y2) / 2 - cy;
     // Cross-axis distance is the GAP between the rects (0 when they overlap on that
@@ -2878,15 +2888,15 @@ static void navPump() {
           { const bool fired = s_f1_fired; s_f1_down_ms = 0; s_f1_fired = false;
             if (fired) break;                                                              // power menu already opened while held
             if (s_nav_ta_editing) { s_nav_ta_editing = false; break; }                     // editing a field: ✕ stops typing first (cursor off → navigate)
-            LvChatPanel* cp = navOpenChatPanel(); if (cp) { closeChatPanel(cp); break; }   // tap: close chat…
-            if (anyPopupOpen()) { hwKeyDismissTopPopup(); break; }                         // …or the topmost modal…
+            if (anyPopupOpen()) { hwKeyDismissTopPopup(); break; }                         // a popup/sheet ON TOP (emoji, quick replies, …) closes FIRST…
+            LvChatPanel* cp = navOpenChatPanel(); if (cp) { closeChatPanel(cp); break; }   // …then an open chat/channel…
             navPushTap(LV_KEY_ESC); }                                                      // …or plain Esc
           break;
         case BSP_INPUT_NAVIGATION_KEY_ESC:
         case BSP_INPUT_NAVIGATION_KEY_GAMEPAD_B:
           if (down && s_nav_ta_editing) { s_nav_ta_editing = false; break; }                          // editing a field: Esc stops typing first (cursor off → navigate)
-          if (down) { LvChatPanel* cp = navOpenChatPanel(); if (cp) { closeChatPanel(cp); break; } }  // close an open chat/channel first
-          if (anyPopupOpen()) { if (down) hwKeyDismissTopPopup(); break; }   // else the topmost modal/sheet
+          if (anyPopupOpen()) { if (down) hwKeyDismissTopPopup(); break; }   // a popup/sheet ON TOP (emoji, quick replies, …) closes FIRST — must precede the chat-close below
+          if (down) { LvChatPanel* cp = navOpenChatPanel(); if (cp) { closeChatPanel(cp); break; } }  // then an open chat/channel
           navFifoPush(LV_KEY_ESC, down);
           break;
         // Coloured shape keys (left→right F2..F6 = △ □ ○ ♣ ◇). On a MAIN page they jump
@@ -2994,7 +3004,10 @@ static bool navCollect(lv_obj_t* obj) {
   uint32_t n = lv_obj_get_child_cnt(obj);
   for (uint32_t i = 0; i < n; i++) {
     lv_obj_t* c = lv_obj_get_child(obj, i);
-    if (c && navCollect(c)) descHasClickable = true;
+    // A horizontal-only secondary target (e.g. a chat row's gear) is collected on its own but must
+    // NOT count as its parent's clickable descendant — else the leaf rule harvests the gear and
+    // drops the row, making the row un-focusable (you could only open settings, never the chat).
+    if (c && navCollect(c) && !lv_obj_has_flag(c, NAV_HMOVE_FLAG)) descHasClickable = true;
   }
   bool meClickable = lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE)
                      && !lv_obj_has_flag(obj, NAV_SKIP_FLAG);   // skip explicit non-nav targets (e.g. the map catcher)
@@ -3129,7 +3142,10 @@ static void navMaybeRebuild() {
   lv_group_remove_all_objs(s_nav_group);
   s_nav_first = s_nav_last = nullptr; s_nav_count = 0;
   if (root) navCollect(root);                              // content items (focus starts here)
-  navAddStatusBarActions();                                // + the visible top-bar action buttons (+ ✓ QR / gear)
+  // Only expose the top-bar action buttons when NOT inside a modal/popup (useTop). A modal on the top
+  // layer must trap keyboard nav to its own controls — otherwise up/down/right would jump out to the
+  // status bar (+ ✓ QR / gear) sitting "under" the popup. Pages + chat keep their top-bar actions.
+  if (!useTop) navAddStatusBarActions();
   // The menu/tab bar is intentionally NOT a focus stop: the directional keys (WASDZ
   // / A-D) navigate screen CONTENT only. Tabs are switched by the dedicated hotkeys
   // — the coloured F-keys on the Tanmatsu, the programmable E/R/T/U/I on the T-Deck —
@@ -3183,6 +3199,20 @@ static void navMaybeRebuild() {
       g_lv.home_apps && lv_obj_is_valid(g_lv.home_apps)) {
     const int n = s_nav_count < kNavMax ? s_nav_count : kNavMax;
     for (int i = 0; i < n; i++) if (s_nav_objs[i] == g_lv.home_apps) { lv_group_focus_obj(g_lv.home_apps); break; }
+  }
+  // Chat list only: it carries horizontal-only gears. If no branch above set focus, land on the
+  // first PRIMARY row, not a gear (navCollect collects a row's gear before the row itself). Guarded
+  // to pages that actually have HMOVE targets so home/settings default-focus behaviour is untouched.
+  if (!focus_set) {
+    const int n2 = s_nav_count < kNavMax ? s_nav_count : kNavMax;
+    bool any_hmove = false;
+    for (int i = 0; i < n2; i++) { lv_obj_t* o = s_nav_objs[i]; if (o && lv_obj_has_flag(o, NAV_HMOVE_FLAG)) { any_hmove = true; break; } }
+    if (any_hmove) {
+      for (int i = 0; i < n2; i++) {
+        lv_obj_t* o = s_nav_objs[i];
+        if (o && lv_obj_is_valid(o) && !lv_obj_has_flag(o, NAV_HMOVE_FLAG)) { lv_group_focus_obj(o); break; }
+      }
+    }
   }
   s_nav_suppress_scroll = false;   // real focus is set — re-enable focus-scroll for live arrow navigation
   s_nav_resel_pending = false;   // consumed this rebuild
@@ -5187,9 +5217,9 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
   // Enlarged on the big Tanmatsu panel so this long-press sheet doesn't look lost
   // (PSC is a no-op on the smaller boards, so they're unchanged).
 #if CAP_LARGE_SCREEN
-  const int card_w = PSC(220);
-  const int btn_h = PSC(42);
-  const int pad = PSC(10);
+  const int card_w = PSC(210);
+  const int btn_h = SC(40);      // SC not PSC: the 1.7x PSC boost made these rows oversized on the Tanmatsu
+  const int pad = PSC(8);
 #else
   const int card_w = 220;
   const int btn_h = 42;
@@ -5752,12 +5782,12 @@ static void openQuickReplyPicker(LvChatPanel* p) {
 
   // Bigger on the 800-px Tanmatsu panel; unchanged on the smaller boards.
 #if CAP_LARGE_SCREEN
-  const int card_w = PSC(220);
-  const int btn_h  = PSC(32);
-  const int pad    = PSC(8);
-  const int title_h = PSC(26);
-  const int hint_h  = PSC(22);
-  const int row_gap = PSC(4);
+  const int card_w = PSC(210);
+  const int btn_h  = SC(32);      // SC not PSC: the 1.7x PSC boost made this 6-row card taller than the screen
+  const int pad    = SC(8);
+  const int title_h = SC(26);
+  const int hint_h  = SC(22);
+  const int row_gap = SC(4);
 #else
   const int card_w = 220;
   const int btn_h  = 32;          // 34→32: 6 macro rows have to fit in the
@@ -5766,7 +5796,8 @@ static void openQuickReplyPicker(LvChatPanel* p) {
   const int hint_h  = 22;         // card that clipped behind the bar.
   const int row_gap = 4;
 #endif
-  const int card_h = title_h + TOUCH_QUICK_REPLY_COUNT * (btn_h + row_gap) + hint_h + pad;
+  int card_h = title_h + TOUCH_QUICK_REPLY_COUNT * (btn_h + row_gap) + hint_h + pad;
+  if (card_h > sh - STATUSBAR_H - 8) card_h = sh - STATUSBAR_H - 8;   // never taller than the visible area
   lv_obj_t* card = lv_obj_create(s_qr_sheet);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -6822,6 +6853,10 @@ static void advertAutoLocalCb(lv_event_t* e) {
   uint16_t i = (uint16_t)lv_dropdown_get_selected(lv_event_get_target(e));
   if (i < (sizeof(kAutoLocalMin) / sizeof(kAutoLocalMin[0]))) touchPrefsSetLocalAdvMin(kAutoLocalMin[i]);
 }
+static void advertBootCb(lv_event_t* e) {   // "On boot" switch — one-shot flood advert after boot (#76)
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  touchPrefsSetBootAdvert(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
 static void closeAdvertPage() {
   if (s_advert_root) { lv_obj_del_async(s_advert_root); s_advert_root = nullptr; }
   if (s_apppage_close == closeAdvertPage) {   // release the tall title bar back to normal
@@ -6923,6 +6958,19 @@ static void openAdvertModalCb(lv_event_t* e) {
   lv_obj_set_style_text_font(asec, &g_font_12, LV_PART_MAIN);
   lv_obj_set_pos(asec, 2, y);
   y += SC(22);
+
+  // Advertise on boot (#76): fire one flood advert ~6s after boot so peers with auto-add on
+  // refresh our pubkey (handy after a reflash wiped storage). Opt-in; off by default.
+  lv_obj_t* boot_lab = lv_label_create(body);
+  lv_label_set_text(boot_lab, TR("On boot"));
+  lv_obj_set_style_text_font(boot_lab, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(boot_lab, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(boot_lab, 2, y + SC(6));
+  lv_obj_t* boot_sw = lv_switch_create(body);
+  lv_obj_align(boot_sw, LV_ALIGN_TOP_RIGHT, -4, y);
+  if (touchPrefsGetBootAdvert()) lv_obj_add_state(boot_sw, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(boot_sw, advertBootCb, LV_EVENT_VALUE_CHANGED, nullptr);
+  y += SC(40);
 
   lv_obj_t* flab = lv_label_create(body);
   lv_label_set_text(flab, TR("Flood every"));
@@ -13054,9 +13102,9 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // historical integers, untouched (PSC is a no-op there).
 #if CAP_LARGE_SCREEN
   const int card_w = PSC(232);
-  const int btn_h = PSC(30);
-  const int btn_gap = PSC(6);
-  const int title_h = PSC(28);
+  int btn_h = PSC(30);           // vertical metrics are mutable: the shrink-to-fit below trims them
+  int btn_gap = PSC(6);          // when the big-screen 1.7x scale would push the sheet off-screen
+  int title_h = PSC(28);
   const int padding = PSC(6);
 #else
   const int card_w = 232;
@@ -13064,9 +13112,9 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // clipping below the status bar. Delete spans the full width as the
   // bottom danger row. Repeater worst case: 8 grid items -> 4 rows + 1
   // delete row = 5 * (30+6) + title 28 + pad 6 = 214 px (fits in 298).
-  const int btn_h = 30;
-  const int btn_gap = 6;
-  const int title_h = 28;
+  int btn_h = 30;
+  int btn_gap = 6;
+  int title_h = 28;
   const int padding = 6;
 #endif
   // msg/ping + telemetry + (trace ping + admin, repeaters only) + range
@@ -13100,14 +13148,15 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // line-of-sight (1), + Show on map (1 when contact has GPS and !from_map).
   const int grid_items = (from_map ? 5 : 6) + (is_repeater ? 2 : 0) + (is_room ? 1 : 0) + (has_los ? 1 : 0) + (has_map_btn ? 1 : 0);
   const int grid_rows  = (grid_items + 1) / 2;          // ceil
-  const int card_h = title_h + (grid_rows + 1) * (btn_h + btn_gap) + padding;
-  // On landscape displays (sh=240) the backdrop is only 218px; cap the card
-  // to that space and let it scroll vertically when buttons overflow.
+  int card_h = title_h + (grid_rows + 1) * (btn_h + btn_gap) + padding;
+  // Cap the card to the visible area and let the BUTTON BODY (below the fixed title/X) scroll when it
+  // overflows — so a tall sheet (repeater, big UI scale) always fits on-screen and every button stays
+  // reachable (keyboard nav focus-scrolls it into view). Replaces the old shrink-to-fit-the-rows hack.
   const int avail_card_h = sh - STATUSBAR_H - 4;
-  const int capped_card_h = LV_MIN(card_h, avail_card_h);
+  if (card_h > avail_card_h) card_h = avail_card_h;
   lv_obj_t* card = lv_obj_create(s_action_sheet_root);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, card_w, capped_card_h);
+  lv_obj_set_size(card, card_w, card_h);
   lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
@@ -13115,11 +13164,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, padding, LV_PART_MAIN);
-  if (card_h > capped_card_h) {
-    lv_obj_set_scroll_dir(card, LV_DIR_VER);
-  } else {
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-  }
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);   // title + X stay fixed; the body below scrolls
   addCloseXBadge(card, actionSheetCloseCb);
 
   lv_obj_t* title = lv_label_create(card);
@@ -13137,13 +13182,25 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   lv_obj_set_width(title, card_w - 2 * padding - 28);
   lv_obj_set_pos(title, 0, 0);
 
+  // Scrollable button body below the fixed title/X. The absolute-positioned grid buttons go in here;
+  // when they overflow it scrolls (touch + keyboard focus-scroll), while the title/X stay pinned.
+  lv_obj_t* body = lv_obj_create(card);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_pos(body, 0, title_h);
+  lv_obj_set_size(body, card_w - 2 * padding, card_h - 2 * padding - title_h);
+  lv_obj_set_style_pad_all(body, 0, LV_PART_MAIN);
+  if ((grid_rows + 1) * (btn_h + btn_gap) > card_h - 2 * padding - title_h)
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+  else
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
 #if CAP_LARGE_SCREEN
   const int col_gap = PSC(6);
 #else
   const int col_gap = 6;
 #endif
   const int half_w  = (card_w - 2 * padding - col_gap) / 2;
-  int y   = title_h;
+  int y   = 0;
   int col = 0;   // 0 = left column, 1 = right column
   // On the Tanmatsu the rows are PSC-taller, so step the row label up one font
   // size to fill them; the smaller boards keep the original g_font_12.
@@ -13155,7 +13212,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
 
   // Half-width grid button. Advances column, wrapping to the next row.
   auto mk_btn = [&](const char* label, lv_event_cb_t cb, uint32_t bg) {
-    lv_obj_t* b = lv_btn_create(card);
+    lv_obj_t* b = lv_btn_create(body);
     lv_obj_set_size(b, half_w, btn_h);
     lv_obj_set_pos(b, col == 0 ? 0 : (half_w + col_gap), y);
     styleButton(b);
@@ -13173,7 +13230,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // Full-width row (Delete). Closes any half-open grid row first.
   auto mk_btn_full = [&](const char* label, lv_event_cb_t cb, uint32_t bg) {
     if (col == 1) { col = 0; y += btn_h + btn_gap; }
-    lv_obj_t* b = lv_btn_create(card);
+    lv_obj_t* b = lv_btn_create(body);
     lv_obj_set_size(b, card_w - 2 * padding, btn_h);
     lv_obj_set_pos(b, 0, y);
     styleButton(b);
@@ -18507,9 +18564,11 @@ static void openContactsOverflowSheetCb(lv_event_t* e) {
   // Bigger on the 800-px Tanmatsu panel; unchanged on the smaller boards (PSC no-op).
   // Compact rows so all five buttons + title fit the T-Deck's short 240px landscape
   // screen (the 5th "Blocked list" item pushed the old 36px rows off-screen). #72.
-  const int card_w = PSC(200), btn_h = PSC(30), btn_gap = PSC(4), title_h = PSC(22), padding = PSC(8);
+  const int card_w = PSC(200);
+  const int btn_h = SC(30), btn_gap = SC(4), title_h = SC(22), padding = SC(8);  // SC not PSC: the 1.7x boost clipped the lower rows (Auto-add / Blocked) off-screen at Large scale
   const int rows = 5;
-  const int card_h = title_h + rows * (btn_h + btn_gap) + padding;
+  int card_h = 2 * padding + title_h + rows * btn_h + (rows - 1) * btn_gap;  // reserve BOTH pad_all paddings (top+bottom) or the last row clips
+  if (card_h > sh - STATUSBAR_H - 8) card_h = sh - STATUSBAR_H - 8;   // never taller than the visible area
   lv_obj_t* card = lv_obj_create(s_contacts_overflow_root);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -18521,7 +18580,9 @@ static void openContactsOverflowSheetCb(lv_event_t* e) {
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, padding, LV_PART_MAIN);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);           // safety net: if capped below content (e.g. Huge scale), the lower rows stay reachable
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
 
   lv_obj_t* title = lv_label_create(card);
   lv_label_set_text(title, TR("Contacts"));
@@ -19250,6 +19311,9 @@ static inline void tileCacheMkdir(const char* rel) {
 // the whole FS, so the result is cached ~5 s; this is only ever called on the
 // core-0 fetch task, never the UI thread. Reads keep working, so already-cached
 // areas still display — only NEW tiles stop being cached.
+// #tiles: bytes of tiles written to FFat this session — the Tanmatsu FFat-fallback budget (the SD path
+// isn't space-constrained). Reset each boot; a genuinely-full FAT then just fails writes cleanly.
+static volatile uint32_t s_ffat_tile_bytes  = 0;
 static bool tilesFsLowSpace() {
   if (!s_tiles_fs_ready || !s_tile_fs) return false;   // no cache backend -> nothing to guard
 #if defined(HAS_TANMATSU)
@@ -19257,15 +19321,14 @@ static bool tilesFsLowSpace() {
   // DataStore / chat history). The SD + LittleFS guards below don't cover FFat, so cap it here:
   // stop caching tiles while < ~1.5 MB is free, leaving chat data plenty of room to grow.
   if (s_tile_fs == &FFat) {
-    static uint32_t last_ms = 0; static bool low = false;
-    const uint32_t now = millis();
-    if (last_ms == 0 || (uint32_t)(now - last_ms) >= 5000) {
-      last_ms = now ? now : 1;
-      const size_t tot = FFat.totalBytes(), use = FFat.usedBytes();
-      const size_t freeb = (tot > use) ? (tot - use) : 0;
-      low = (tot > 0) && (freeb < 1536 * 1024);
-    }
-    return low;
+    // Self-tracked byte budget — do NOT use FFat.freeBytes()/usedBytes() here: f_getfree misreports
+    // 0 free clusters on the P4's locfd even when the partition is near-empty, which pinned this guard
+    // permanently ON and blocked EVERY tile (ok 0, wr 'S', before any HTTP). Cap tiles at ~2 MB of the
+    // 3.9 MB partition, leaving the rest for chat/DataStore. A genuinely-full FAT still fails the write
+    // cleanly (open-fail), no crash — unlike LittleFS. Counter resets each boot; the on-disk cache
+    // persists, so worst case across reboots the FAT fills and writes fail cleanly (TODO: persist/scan).
+    const uint32_t budget = 2048u * 1024u;
+    return s_ffat_tile_bytes >= budget;
   }
 #endif
   // This guard exists ONLY for the small (4.75 MB) LittleFS "tiles" partition,
@@ -20013,29 +20076,25 @@ static void tileFetchTaskFn(void* arg) {
              "%s/%u/%ld/%ld.jpg", froot, (unsigned)req.z, (long)req.x, (long)req.y);
     snprintf(path_png, sizeof(path_png),
              "%s/%u/%ld/%ld.png", froot, (unsigned)req.z, (long)req.x, (long)req.y);
-    if (tileCacheExists(path_jpg)) {
-      // Validate it's actually a JPEG. An older build — or a proxy/OSM error
-      // response cached as a .jpg — leaves a non-image that renders as a BLACK
-      // quadrant, and because the file "exists" the fetcher used to skip it
-      // forever (never re-fetched). Read the 2 magic bytes (cheap, on this fetch
-      // thread) and re-download if they're wrong.
-      bool good = false;
+    // Already cached + valid? OPEN directly and read the 3-byte JPEG SOI — do NOT use tileCacheExists()
+    // or vf.size() here: FFat f_stat misreports on the P4 (exists()->false, size()->0) so those made the
+    // fetcher re-download + re-write every already-cached tile forever, churning open-fails (#tiles).
+    // open() returning an invalid File is the real "not cached" signal.
+    {
       File vf = tileCacheOpen(path_jpg, "r");
       if (vf) {
-        uint8_t m[2] = {0, 0};
-        if (vf.size() >= 2 && vf.read(m, 2) == 2 && m[0] == 0xFF && m[1] == 0xD8) good = true;
+        uint8_t m[3] = {0, 0, 0};
+        const int mr = vf.read(m, 3);
         vf.close();
+        if (mr == 3 && m[0] == 0xFF && m[1] == 0xD8 && m[2] == 0xFF) {
+          ++s_tile_fetch_ok;                         // already on disk + valid -> skip the re-download
+          if (s_tile_fetch_pending > 0) --s_tile_fetch_pending;
+          continue;
+        }
+        tileCacheRemove(path_jpg);   // present but unreadable/short/bad -> fall through and re-download
       }
-      if (good) {
-        ++s_tile_fetch_ok;
-        if (s_tile_fetch_pending > 0) --s_tile_fetch_pending;
-        continue;
-      }
-      tileCacheRemove(path_jpg);   // bad cached tile — fall through and re-download a good one
     }
-    if (tileCacheExists(path_png)) {
-      tileCacheRemove(path_png);   // stale noise-tile — reclaim the space
-    }
+    tileCacheRemove(path_png);   // drop any stale .png from an older build — remove is a no-op if absent (don't gate on the broken exists())
 
     // Heap-safety gate: opening a TCP socket costs ~6 KB of internal DMA
     // RAM, and the Wi-Fi driver needs more on top for RX. If internal
@@ -20155,6 +20214,7 @@ static void tileFetchTaskFn(void* arg) {
           f.close();
           if (!disk_err && !bad_content && remaining == 0 && disk_written == (size_t)content_len) {
             wrote = true;
+            s_ffat_tile_bytes += (uint32_t)disk_written;   // #tiles: track FFat tile-cache growth for the budget guard (Tanmatsu; unused elsewhere)
           } else {
             tileCacheRemove(path_jpg);               // partial / bad / failed write — discard
             if (bad_content) {
@@ -20441,31 +20501,34 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
   }
 #endif
   if (!s_tiles_fs_ready) return false;
-  if (!tileCacheExists(path)) return false;
+  // Open directly — do NOT gate on tileCacheExists() and do NOT trust f.size(): on the P4's FFat the
+  // f_stat metadata layer misreports (exists()->false for present files, size()->0/huge), the same
+  // broken layer as f_getfree's 0-free. That made every cached tile look absent, so the map
+  // re-downloaded forever and rendered nothing (#tiles). open() is the real existence test; read up to
+  // the 100 KB writer cap and use the ACTUAL bytes read. (S3 boards: f.size() works there, but this is
+  // equally correct — a transient 100 KB PSRAM buffer per tile, freed right after decode.)
   File f = tileCacheOpen(path, "r");
   if (!f) return false;
-  const size_t sz = f.size();
-  // Cap MUST match the fetcher's write cap (100 KB, see tileFetchTaskFn). It was
-  // 80 KB here while the writer allowed up to 100 KB, so a dense tile saved at
-  // 80-100 KB was written to cache but then silently REJECTED on read — it never
-  // rendered, and the map sat on "Downloading…" for that area forever.
-  if (sz == 0 || sz > 100 * 1024) { f.close(); return false; }  // sanity cap (matches writer)
-  uint8_t* buf = (uint8_t*)lvglPsramAlloc(sz);
+  const size_t CAP = 100 * 1024;
+  uint8_t* buf = (uint8_t*)lvglPsramAlloc(CAP);
   if (!buf) { f.close(); return false; }
-  const size_t n = f.read(buf, sz);
+  size_t n = 0;
+  while (n < CAP) {
+    const int r = f.read(buf + n, CAP - n);
+    if (r <= 0) break;
+    n += (size_t)r;
+  }
   f.close();
-  if (n != sz) { lvglPsramFree(buf); return false; }
-  // Reject a cached tile whose header isn't a JPEG SOI — a garbled/partial download
-  // that slipped through decodes to a blank/half "twilight zone" tile otherwise.
-  // Drop it from the writable online cache so the render miss re-queues a fresh
-  // fetch; never touch read-only SD map packs (can't re-download those).
-  if (sz < 3 || buf[0] != 0xFF || buf[1] != 0xD8 || buf[2] != 0xFF) {
+  // Reject a cached tile whose header isn't a JPEG SOI — a garbled/partial download that slipped
+  // through decodes to a blank/half "twilight zone" tile otherwise. Drop it from the writable online
+  // cache so the render miss re-queues a fresh fetch; never touch read-only SD packs (can't re-fetch).
+  if (n < 3 || buf[0] != 0xFF || buf[1] != 0xD8 || buf[2] != 0xFF) {
     lvglPsramFree(buf);
     if (!s_tiles_from_sd) tileCacheRemove(path);
     return false;
   }
   *out_data = buf;
-  *out_len  = sz;
+  *out_len  = n;
   return true;
 #else
   (void)z; (void)x; (void)y; (void)out_data; (void)out_len;
@@ -20510,10 +20573,13 @@ static bool tileExistsAt(uint8_t z, long x, long y) {
 #endif
   if (!s_tiles_fs_ready) return false;
   char p[48];
+  // open() not tileCacheExists(): FFat exists()/f_stat lies on the P4 (present files read as missing),
+  // which would make the zoom guard think whole levels are un-cached. A successful open == it's there.
   snprintf(p, sizeof p, "%s/%u/%ld/%ld.jpg", mapTileRoot(), (unsigned)z, x, y);
-  if (tileCacheExists(p)) return true;
+  { File f = tileCacheOpen(p, "r"); if (f) { f.close(); return true; } }
   snprintf(p, sizeof p, "%s/%u/%ld/%ld.png", mapTileRoot(), (unsigned)z, x, y);
-  return tileCacheExists(p);
+  { File f = tileCacheOpen(p, "r"); if (f) { f.close(); return true; } }
+  return false;
 }
 #endif  // ESP32
 
@@ -20779,13 +20845,17 @@ static void renderMapTiles() {
     // 403/-1 = blocked/connect fail) means the server/proxy path is the problem,
     // not the on-device renderer.
 #if defined(MULTI_TRANSPORT_COMPANION)
-    char dl[240];
+    char dl[288];
     snprintf(dl, sizeof dl,
         "Downloading map tiles\xe2\x80\xa6  (%s)\n"
         "ok %u   fail %u   http %d   wr %c\n"
         "open-fail %u   short-wr %u\n\n"
         "Keep Wi-Fi connected.\nTiles appear as they arrive.",
+#if defined(HAS_TANMATSU)
+        (s_tile_fs == &SD_MMC ? "SD cache" : "flash cache"),
+#else
         (s_tile_root[0] ? "SD cache" : "flash cache"),
+#endif
         (unsigned)s_tile_fetch_ok, (unsigned)s_tile_fetch_failed,
         (int)s_tile_fetch_last_code, (char)s_tile_fetch_last_wr,
         (unsigned)s_tile_fetch_open_fail, (unsigned)s_tile_fetch_short_wr);
@@ -24949,6 +25019,7 @@ static void refreshChatList(LvChatPanel& p) {
       lv_obj_t* gear = lv_btn_create(btn);
       lv_obj_remove_style_all(gear);
       lv_obj_add_flag(gear, LV_OBJ_FLAG_IGNORE_LAYOUT);
+      lv_obj_add_flag(gear, NAV_HMOVE_FLAG);   // keyboard nav: reach the gear with RIGHT (not UP/DOWN); keeps the row itself focusable so the chat opens
       lv_obj_set_size(gear, gear_w, 30);
       lv_obj_align(gear, LV_ALIGN_RIGHT_MID, -2, 0);
       lv_obj_add_event_cb(gear, threadGearCb, LV_EVENT_CLICKED, &p.ctx_store[i]);
@@ -32977,8 +33048,17 @@ static bool    s_ui_data_resolved = false;
 static bool uiDataFsReady() {
   if (s_ui_data_fs != nullptr) return true;   // cache SUCCESS only — a failed resolve MUST stay retryable
 #if defined(HAS_TANMATSU)
-  // Tanmatsu: no SD global + no SPIFFS partition — chat history lives on the internal
-  // 'locfd' FAT partition (mounted at boot in main.cpp; same store as DataStore + the FM).
+  // Tanmatsu: prefer the microSD card. The internal FFat 'locfd' loses frequently-rewritten data on
+  // this P4 (broken FAT metadata; see the tile-cache notes), so chat history vanished on reboot. SD is
+  // reliable FAT — mirror the T-Deck's /meshcomod root. Fall back to FFat only when no card is present.
+  // Both are mounted at boot in main.cpp (g_sd_ok / g_fs_ok).
+  extern bool g_sd_ok;
+  if (g_sd_ok) {
+    SD_MMC.mkdir("/meshcomod");
+    s_ui_data_fs = &SD_MMC;
+    strncpy(s_ui_data_root, "/meshcomod", sizeof s_ui_data_root - 1);
+    return true;
+  }
   extern bool g_fs_ok;
   if (g_fs_ok) { s_ui_data_fs = &FFat; s_ui_data_root[0] = '\0'; return true; }
 #elif defined(HAS_TDECK_GT911)
@@ -34099,18 +34179,23 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   }
 #endif
 #if defined(HAS_TANMATSU)
-  // Tanmatsu's 16M.csv has no dedicated "tiles" partition (and no SPIFFS/SD), so the
-  // LittleFS mount above fails. Rather than surface a "reflash the partition" error,
-  // fall back to the internal FFat ('locfd') data partition the file browser already
-  // uses — Wi-Fi-fetched tiles cache to /tiles/<z>/<x>/<y>.jpg there and render exactly
-  // like the partition/SD backends (the render + fetch paths are fs-agnostic via the
-  // tileCache* helpers). Same "this board uses FFat" precedent as the chat-history store
-  // (s_ui_data_fs = &FFat). Network-only in practice: empty until Wi-Fi downloads tiles.
+  // Tanmatsu has no dedicated "tiles" partition. PREFER the microSD card for the tile cache: the
+  // internal FFat 'locfd' partition has a broken FAT metadata layer on this P4 — f_getfree reports
+  // 0 free and f_stat (exists()/size()) misreports present files as missing — so cached tiles were
+  // unreadable and the map re-downloaded forever, rendering nothing (#tiles). SD is reliable FAT +
+  // gigabytes; tiles cache to /tiles/<z>/<x>/<y>.jpg there and render via the fs-agnostic tileCache*
+  // helpers (same shape as the T-Deck SD path). Fall back to the (quirky) FFat only when no card.
+  else if (tanSdTryMount()) {
+    s_tile_fs        = &SD_MMC;
+    s_tile_root[0]   = '\0';
+    s_tiles_fs_ready = true;
+    WIRE_DBG("[TILE] Tanmatsu: caching Wi-Fi tiles on microSD /tiles (SD_MMC)");
+  }
   else if (g_fs_ok) {
     s_tile_fs        = &FFat;
-    s_tile_root[0]   = '\0';   // -> /tiles/<z>/<x>/<y>.jpg, a self-contained dir on locfd
+    s_tile_root[0]   = '\0';   // no card -> internal FFat (best-effort; f_stat quirks may hamper reads)
     s_tiles_fs_ready = true;
-    WIRE_DBG("[TILE] no tiles partition -> caching Wi-Fi tiles on FFat /tiles (Tanmatsu)");
+    WIRE_DBG("[TILE] Tanmatsu: no SD card -> caching Wi-Fi tiles on FFat /tiles (best-effort)");
   }
 #endif
   else {
@@ -35586,12 +35671,31 @@ void UITask::loop() {
   // radio forever — so re-apply the mesh params and release ownership here.
   if (s_spectrum_active && !s_spec_root) spectrumRestoreRadio();
   flushHistoryIfDue(now);
-  // A contact was discovered/added (possibly while a companion app was connected —
-  // the old code left the device screen unaware; issue #73). Rebuild the Contacts
-  // list if it's the visible tab; refreshContactsList no-op's when nothing changed.
-  if (s_ct_contacts_dirty) {
-    s_ct_contacts_dirty = false;
-    if (getActiveTab() == CONTACTS_TAB_INDEX) refreshContactsList();
+  // A contact was discovered/updated via an advert — possibly while a companion app was connected
+  // over BLE (issue #73). FORCE the rebuild: an advert can fill in a name, or refresh an existing
+  // (or app-added) contact, WITHOUT changing getNumContacts() — which the count-cached
+  // refreshContactsList() would no-op, leaving the node invisible until a manual re-sort (exactly the
+  // "only shows when I sort by messages received" report). Keep the flag set until we're actually on
+  // the Contacts tab so an advert heard on another tab isn't dropped, and coalesce an advert flood to
+  // at most one rebuild per ~350 ms.
+  if (s_ct_contacts_dirty && getActiveTab() == CONTACTS_TAB_INDEX) {
+    static unsigned long s_ct_dirty_refresh_ms = 0;
+    if ((now - s_ct_dirty_refresh_ms) > 350) {
+      s_ct_contacts_dirty   = false;
+      s_ct_dirty_refresh_ms = now;
+      contactsListForceRefresh();   // bypass the count-cache — a name-fill / re-advert doesn't change the count
+    }
+  }
+  // Safety net (#73): some contact mutations never set the dirty flag above — messaging a not-yet-
+  // added node creates an anon contact (core addContact), the companion app imports one over BLE
+  // (CMD_ADD_UPDATE_CONTACT), a delete removes one. getNumContacts() is O(1), so cheaply catch ANY
+  // count change while the Contacts tab is visible and rebuild, independent of adverts.
+  {
+    static int s_ct_seen_count = -1;
+    if (getActiveTab() == CONTACTS_TAB_INDEX) {
+      const int nct = the_mesh.getNumContacts();
+      if (nct != s_ct_seen_count) { s_ct_seen_count = nct; refreshContactsList(); }
+    }
   }
 #if defined(HAS_TANMATSU)
   if (s_msgled_flash_until) msgLedRefresh(getUnreadTotal() > 0);   // end the one-shot envelope-LED flash on time
@@ -35932,9 +36036,16 @@ void UITask::loop() {
   if (s_kb_bl_mode == 1) kb_bl = 0xFF;
   else if (s_kb_bl_mode == 2 && (now - s_kb_last_key_ms) < kKbBacklightIdleMs) kb_bl = 0xFF;
   if (_screen_off || _manual_lock) kb_bl = 0;   // dark/locked screen -> keep the keyboard dark too
-  // New-message notify flash: wake the screen so the message is visible, then briefly force the
-  // keyboard lit for the pulse window (overrides the off/idle backlight mode).
-  if (s_msgflash_wake) { s_msgflash_wake = false; if (_screen_off) wakeScreen(); }
+  // New-message notify flash: light the screen so the user sees a message arrived. When the
+  // screen is hard-locked, REVEAL the lock screen (lights the wallpaper, keeps the lock) rather
+  // than wakeScreen() — wakeScreen() clears _manual_lock, which would leave the lock overlay up
+  // but the trackball hold-to-unlock inert (the "can't unlock after a message; have to re-lock
+  // with space first" bug). Only an unlocked idle-dim gets the full wake + keyboard pulse.
+  if (s_msgflash_wake) {
+    s_msgflash_wake = false;
+    if (_manual_lock)     lockscreenReveal();   // locked: light wallpaper, keep the lock (unlock still works)
+    else if (_screen_off) wakeScreen();         // idle-dimmed: normal wake
+  }
   if (!_screen_off && !_manual_lock && s_msgflash_until && (int32_t)(now - s_msgflash_until) < 0) kb_bl = 0xFF;
   tdeckKeyboardSetBacklight(kb_bl);
   serviceLockscreen();            // refresh the lock-screen clock on minute roll-over
@@ -35974,6 +36085,20 @@ void UITask::loop() {
   // in the Advertise app, stored in TouchPrefsStore). Separate from the signal probe above, which
   // only floods when the mesh has gone quiet. First fire lands one full interval after enable/boot.
   {
+    // One-shot flood self-advert shortly after boot (opt-in, #76; off by default). Refreshes our
+    // pubkey for peers with auto-add on — useful after a reflash wiped storage and left them a stale
+    // identity. Fires once per boot; enabling mid-session waits for the next boot (it IS a boot advert).
+    static bool     s_boot_adv_done = false;
+    static uint32_t s_boot_adv_at   = 0;
+    if (!s_boot_adv_done) {
+      if (!touchPrefsGetBootAdvert())      s_boot_adv_done = true;              // disabled — never fire this session
+      else if (!s_boot_adv_at)             s_boot_adv_at   = (uint32_t)now + 6000u;   // arm ~6s after first loop
+      else if ((int32_t)((uint32_t)now - s_boot_adv_at) >= 0) {
+        the_mesh.sendAdvert(true);         // flood: reaches peers across repeaters (region-scoped like #68)
+        s_boot_adv_done = true;
+      }
+    }
+
     static uint32_t s_next_flood_adv = 0, s_next_local_adv = 0;
     const uint16_t fh = touchPrefsGetFloodAdvHrs();
     if (fh) {

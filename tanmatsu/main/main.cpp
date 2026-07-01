@@ -14,6 +14,7 @@
 #include "target.h"            // board, radio_driver, rtc_clock, display, sensors, radio_init()
 #include <SPIFFS.h>
 #include <FFat.h>            // DataStore persists on the internal 'locfd' FAT partition
+#include <SD_MMC.h>          // microSD (slot 0): reliable store for contacts/channels/chat (internal FFat loses them on this P4)
 #include "esp_partition.h"   // enumerate partitions (AppFS apps boot fresh — verify locfd is visible)
 #include <WiFi.h>
 #include <helpers/esp32/MultiTransportCompanionInterface.h>
@@ -54,6 +55,7 @@ void halt() { while (1) { delay(1000); } }
 // DataStore takes — FILESYSTEM == fs::FS on ESP32). See the storage block in setup().
 DataStore store(FFat, rtc_clock);
 bool g_fs_ok = false;   // true once FFat(locfd) is mounted; UITask's file browser checks this (extern)
+bool g_sd_ok = false;   // true once the microSD (SD_MMC) is mounted; contacts/channels/chat persist there (extern)
 MultiTransportCompanionInterface serial_interface;
 StdRNG fast_rng;
 SimpleMeshTables tables;
@@ -298,9 +300,12 @@ static void hostedConnectC6() {
 }
 
 static void wadameshSetup() {
-  Serial.begin(115200);
+  // Do NOT call Serial.begin() on the Tanmatsu (P4). The launcher already owns the USB-Serial-JTAG
+  // console; re-initialising it here crashed the app during boot (before the splash could even draw
+  // — the beta_21+ symptom of "blue screen, no boot log"). Serial output is swallowed on this board's
+  // IDF console anyway, so printf (not Serial) carries the [BOOT] logs. See tanmatsu-serial-begin memory.
   delay(150);
-  Serial.println("[BOOT] wadamesh / tanmatsu");
+  printf("[BOOT] wadamesh / tanmatsu\n");
 
   // badge-bsp: panel + input + power. The panel must be up before LVGL flushes to it; ask for
   // RGB565 to match LVGL's 16-bit color depth (lvglFlush -> writePixelsRGB565 -> bsp_display_blit).
@@ -369,6 +374,13 @@ static void wadameshSetup() {
   } else {
     printf("[storage] persistence disabled this boot (DataStore opens fail gracefully)\n");
   }
+  // The internal FFat 'locfd' on this P4 has a broken FAT metadata layer (see the tile-cache notes):
+  // it keeps rarely-written data (identity/prefs) but LOSES the frequently-rewritten contacts + chat on
+  // reboot. So route contacts/channels (and chat history, see uiDataFsReady) to the microSD card, which
+  // is reliable FAT. Identity/NodePrefs stay on FFat — they persist there and survive a card-less boot.
+  g_sd_ok = SD_MMC.begin("/sdcard", false /*1-bit*/) && SD_MMC.cardType() != CARD_NONE;
+  printf("[storage] SD_MMC.begin = %s\n", g_sd_ok ? "OK" : "no card");
+  if (g_sd_ok) store.setSecondaryFS(&SD_MMC);   // contacts + channels -> SD; identity/prefs stay on FFat
   store.begin();
 
   bootLog("Mesh stack");

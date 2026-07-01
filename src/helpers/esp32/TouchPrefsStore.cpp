@@ -35,7 +35,7 @@ static bool s_begun = false;
 // short read (→ treat as absent → defaults); `ver` lets later builds add fields.
 static const char* KEY_CFG = "cfg";
 static const uint16_t TOUCH_CFG_MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static const uint8_t  TOUCH_CFG_VER   = 28;  // v2 sig_probe/poll; v3 tz_zone; v4 hide_node_name; v5 map_night/map_zoom; v6 map text/marker visibility; v7 app_grid_large; v8 ui_scale; v9 tb_keypad; v10 sleep_idle; v11 nav_keys; v12 map_zoom_buttons; v13 nav_dir_keys; v14 home_is_drawer; v15 kbd_nav default ON (one-time migrate); v16 nav_scroll_keys; v17 notify_new_contact; v18 kbd_nav OFF by default (reverses v15; T-Deck/V4 only, Tanmatsu stays on); v19 show_sensors_tab; v20 map_show_links; v21 map_style (0=OSM default, 1=OpenTopoMap); v22 tb_nav; v23 scope_direct (opt-in: scope direct/login floods to the region); v24 tb_nav default OFF (experimental); v25 fem_lna (Heltec V4.3 high-gain FEM LNA, opt-in); v26 msg_flash (flash keyboard backlight + wake screen on a new message, opt-in); v27 flood_adv_hrs + local_adv_min (periodic self-advert intervals, the standard MeshCore flood/local advert on a timer); v28 beta_updates (opt-in to test/beta firmware on the OTA update check + install)
+static const uint8_t  TOUCH_CFG_VER   = 30;  // v2 sig_probe/poll; v3 tz_zone; v4 hide_node_name; v5 map_night/map_zoom; v6 map text/marker visibility; v7 app_grid_large; v8 ui_scale; v9 tb_keypad; v10 sleep_idle; v11 nav_keys; v12 map_zoom_buttons; v13 nav_dir_keys; v14 home_is_drawer; v15 kbd_nav default ON (one-time migrate); v16 nav_scroll_keys; v17 notify_new_contact; v18 kbd_nav OFF by default (reverses v15; T-Deck/V4 only, Tanmatsu stays on); v19 show_sensors_tab; v20 map_show_links; v21 map_style (0=OSM default, 1=OpenTopoMap); v22 tb_nav; v23 scope_direct (opt-in: scope direct/login floods to the region); v24 tb_nav default OFF (experimental); v25 fem_lna (Heltec V4.3 high-gain FEM LNA, opt-in); v26 msg_flash (flash keyboard backlight + wake screen on a new message, opt-in); v27 flood_adv_hrs + local_adv_min (periodic self-advert intervals, the standard MeshCore flood/local advert on a timer); v28 beta_updates (opt-in to test/beta firmware on the OTA update check + install); v29 ui_scale default -> Large/150% (Tanmatsu; bumps the old 100% default, leaves an explicit Large/Huge choice); v30 boot_advert (opt-in one-shot flood self-advert ~6s after boot, all boards, #76)
 
 // Defaults (kept identical to the historical per-key defaults).
 static const uint16_t DEFAULT_SCREEN_TIMEOUT_S = 20;
@@ -99,6 +99,7 @@ struct __attribute__((packed)) TouchCfg {
   uint8_t  flood_adv_hrs;     // periodic flood self-advert interval in hours (0 = off) — v27 (trailing)
   uint16_t local_adv_min;     // periodic zero-hop self-advert interval in minutes (0 = off) — v27 (trailing)
   uint8_t  beta_updates;      // opt-in to test/beta firmware on the OTA check + install (bool) — v28 (trailing)
+  uint8_t  boot_advert;       // one-shot flood self-advert ~6s after boot (bool, 0=off) — v30 (trailing) — #76
 };
 
 static TouchCfg s_cfg;
@@ -155,7 +156,7 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.map_show_tilexyz  = 1;
   c.map_show_contacts = 1;
   c.app_grid_large    = 0;      // default: compact app grid (T-Deck 4 cols / V4 3 cols)
-  c.ui_scale          = 0;      // default: 100% UI scale (native resolution)
+  c.ui_scale          = 1;      // default: 150% "Large" UI scale (Tanmatsu; S3 boards ignore this)
 #if defined(HAS_TANMATSU)
   c.kbd_nav           = 1;      // Tanmatsu: no touchscreen — keyboard nav is the only input, always on
 #else
@@ -168,6 +169,7 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.flood_adv_hrs     = 0;      // OFF: no periodic flood self-advert (advertise manually)
   c.local_adv_min     = 0;      // OFF: no periodic zero-hop self-advert
   c.beta_updates      = 0;      // OFF: stable update channel (opt-in to beta/test firmware)
+  c.boot_advert       = 0;      // OFF: no automatic advert on boot — opt-in (#76)
   c.sleep_idle        = 0;      // default: idle light-sleep OFF
   { const char* d = "ertui"; for (int i = 0; i < 5; i++) c.nav_keys[i] = (uint8_t)d[i]; }  // default tab hotkeys E/R/T/U/I
   c.map_zoom_buttons  = 0;      // default: map zoom = slider
@@ -246,6 +248,8 @@ static void cfgLoadOrMigrate() {
         if (s_cfg.ver < 26) s_cfg.msg_flash = 0;
         if (s_cfg.ver < 27) { s_cfg.flood_adv_hrs = 0; s_cfg.local_adv_min = 0; }
         if (s_cfg.ver < 28) s_cfg.beta_updates = 0;
+        if (s_cfg.ver < 29 && s_cfg.ui_scale == 0) s_cfg.ui_scale = 1;   // bump old 100% default -> Large (150%)
+        if (s_cfg.ver < 30) s_cfg.boot_advert = 0;   // #76 new trailing field: advert-on-boot off by default
         s_cfg.ver = TOUCH_CFG_VER;
         s_cfg.magic = TOUCH_CFG_MAGIC;
         cfgFlush();                // rewrite with new fields defaulted-in
@@ -974,6 +978,16 @@ bool touchPrefsGetMsgFlash() {
 bool touchPrefsSetMsgFlash(bool on) {
   if (!s_begun) touchPrefsBegin();
   s_cfg.msg_flash = on ? 1 : 0;
+  return cfgFlush();
+}
+
+bool touchPrefsGetBootAdvert() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.boot_advert != 0;
+}
+bool touchPrefsSetBootAdvert(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.boot_advert = on ? 1 : 0;
   return cfgFlush();
 }
 

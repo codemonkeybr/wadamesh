@@ -41,7 +41,7 @@ set(WADA_DEFS
   MULTI_TRANSPORT_COMPANION TCP_PORT=5000 WS_PORT=8765
   BLE_PIN_CODE=123456                       # enables the app's NimBLE companion (BLE over the C6)
   LORA_FREQ=869.618 LORA_BW=62.5 LORA_SF=8
-  MAX_CONTACTS=500 MAX_GROUP_CHANNELS=40   # 2000 was a ~400KB internal-DRAM strand; BT's SDIO RX buffers (MALLOC_CAP_INTERNAL|DMA) need that headroom
+  MAX_CONTACTS=2000 MAX_GROUP_CHANNELS=40  # P4 has ample RAM; contacts array is PSRAM-resident (the_mesh placement-new)
   ENABLE_PRIVATE_KEY_IMPORT=1 ENABLE_PRIVATE_KEY_EXPORT=1
   DISPLAY_CLASS=TanmatsuDisplay
   # microSD lives on the P4's SDMMC *slot 0* (IOMUX pins CLK43/CMD44/D0-3 39-42); slot 1 is the
@@ -53,5 +53,12 @@ set(WADA_DEFS
 foreach(_d ${WADA_DEFS})
   idf_build_set_property(COMPILE_OPTIONS "-D${_d}" APPEND)
 endforeach()
+
+# Firmware version shown on the About page. The Tanmatsu builds outside the S3 release.sh flow (which
+# injects these), so set them here or About shows only a generic "development build" with no version.
+# Quotes are escaped so the compiler sees string literals. TODO: have build.sh pass the real tag/date
+# per release (e.g. from git describe) instead of hardcoding; bump this each beta for now.
+idf_build_set_property(COMPILE_OPTIONS "-DFIRMWARE_RELEASE_TAG=\"beta_25\"" APPEND)
+idf_build_set_property(COMPILE_OPTIONS "-DFIRMWARE_BUILD_DATE=\"1 Jul 2026\"" APPEND)
 # (the adcAttachPin compat shim is force-included per-component in meshcore + wadamesh_app —
 #  NOT globally, which would feed the C++ header to FreeRTOS's .S assembly files and break them.)

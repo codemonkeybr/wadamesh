@@ -1,5 +1,11 @@
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
 #include "MqttBridge.h"
+
+// The single global bridge instance (extern in the header). Defined for every board: the header
+// makes MqttBridge a no-op stub on the Tanmatsu, and the real bridge below on all other boards.
+MqttBridge mqtt_bridge;
+
+#if !defined(HAS_TANMATSU)   // ---- real PubSubClient/WiFiClient implementation; NOT built on the P4 ----
 #include <Preferences.h>
 #include <WiFi.h>
 #include <stdio.h>
@@ -8,8 +14,6 @@
 #include "mbedtls/gcm.h"
 #include "mbedtls/md.h"
 #include "mbedtls/base64.h"
-
-MqttBridge mqtt_bridge;
 
 // Read every field from the "mqtt" NVS namespace into the members. isKey() guards
 // avoid the [E] NOT_FOUND log spam that getString emits for absent keys on the
@@ -212,4 +216,5 @@ void MqttBridge::reloadConfig() {
                   _host, _port, (int)_enabled, (int)_pubDm, (int)_pubChannel, (int)_encOn);
 }
 
+#endif // !HAS_TANMATSU (real implementation)
 #endif // ESP32 && MULTI_TRANSPORT_COMPANION

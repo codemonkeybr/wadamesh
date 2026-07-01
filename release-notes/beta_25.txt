@@ -1,0 +1,18 @@
+# beta_25 (TEST build — one user-facing note per non-blank, non-# line; # lines are section comments)
+
+# --- Fixed ---
+Contacts you discover now show up in your contact list right away — even if the device was on another screen, or the node was added by the phone app over Bluetooth. No more changing the sort to make them appear. Thanks to 1nerdherder for the report.
+Manual telemetry and status requests now work on the first tap instead of needing a second. Thanks to Dan Vybiral (@Vybo) for the fix.
+On the emoji picker and quick-chat replies, pressing Esc or the red X now closes just the popup instead of the whole chat screen.
+Lock screen: you can now unlock the device after the screen wakes from an incoming message.
+
+# --- New ---
+New "Advertise on boot" option in the Advertise app (off by default): turn it on to send one advert when the device powers on, so nearby nodes refresh your details after a reflash.
+
+# --- Tanmatsu ---
+Tanmatsu: Wi-Fi map tiles now download and display, cached to the microSD card.
+Tanmatsu: contacts and message history now survive a reboot (moved to the microSD card, so keep a card inserted).
+Tanmatsu: fixed the crash that stopped the app from booting; popups now fit the screen and scroll, and keyboard navigation stays inside an open popup.
+
+# --- Also ---
+This is a test-channel build (opt in with "Get test builds" on the About screen). Everything from the stable beta_21 and the earlier test builds is included.

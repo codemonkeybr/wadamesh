@@ -2,6 +2,25 @@
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
 
 #include <Arduino.h>
+
+#if defined(HAS_TANMATSU)
+// ---- MQTT DISABLED on the Tanmatsu (ESP32-P4) ----
+// The P4's Wi-Fi runs through the esp-hosted C6 co-processor; the Arduino WiFiClient / PubSubClient
+// path this bridge uses is not wired for that and crashed at boot. Provide a no-op bridge with the
+// SAME public API so the shared companion + settings code links without pulling PubSubClient into
+// the P4 build. Re-enable once esp-hosted TCP is proven on the Tanmatsu.
+class MqttBridge {
+public:
+    void begin(const char* /*nodeHex*/) {}
+    void loop() {}
+    void publishDM(const char*, const uint8_t*, float, uint8_t, uint32_t, const char*) {}
+    void publishChannel(int, const char*, float, uint8_t, uint32_t, const char*) {}
+    bool enabled() const { return false; }
+    static void saveConfig(const char*, uint16_t, const char*, const char*,
+                           bool, bool, const char*, bool) {}
+    void reloadConfig() {}
+};
+#else
 #include <PubSubClient.h>
 #include <WiFiClient.h>
 
@@ -78,6 +97,7 @@ private:
     bool sealToB64(const char* plain, char* out, size_t outCap);
     static void escapeJson(const char* src, char* dst, size_t dstLen);
 };
+#endif // HAS_TANMATSU (no-op stub) vs real MqttBridge
 
 extern MqttBridge mqtt_bridge;
 

@@ -51,6 +51,9 @@ vend "MicroNMEA"             # GPS NMEA parsing
 vend "AsyncTCP"              # the core's ESP32Board HTTP-OTA + companion-over-IP transport
 vend "ESPAsyncWebServer"     # WebSocket/HTTP companion server (needs the task WDT on — sdkconfigs/wadamesh)
 vend "AsyncElegantOTA"       # OTA web UI (the core's ESP32Board HTTP-OTA)
+# NOTE: PubSubClient is deliberately NOT vended — the MQTT bridge is compiled out on the Tanmatsu
+# (HAS_TANMATSU no-op stub in MqttBridge.h); the P4's esp-hosted Wi-Fi isn't wired for it and it
+# crashed the app at boot. Re-add this vend if MQTT is ever brought up on the P4.
 # Bump the component CMakeLists so the next build re-globs (IDF component scripts can't use
 # file(GLOB CONFIGURE_DEPENDS) — they run in script mode during requirement expansion).
 touch components/meshcore/CMakeLists.txt components/ardlibs/CMakeLists.txt 2>/dev/null || true
