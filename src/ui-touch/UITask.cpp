@@ -3632,7 +3632,8 @@ static lv_obj_t* s_chat_unread_badge = nullptr;  // red unread-count badge over 
 static lv_obj_t* s_tab_indicator    = nullptr;   // thin rounded accent glow bar under the active tab
 static lv_obj_t* s_update_subtab_badge = nullptr;// red dot over the "About" sub-tab button
 static lv_obj_t* s_update_about_lbl = nullptr;   // status line on the About sub-tab
-static lv_obj_t* s_sysinfo_lbl      = nullptr;   // System-info text (refreshed live on the About tab)
+static lv_obj_t* s_sysinfo_lbl      = nullptr;   // System-info LIVE tier (uptime/heap, 1 Hz on the About tab)
+static lv_obj_t* s_sysinfo_rest_lbl = nullptr;   // System-info slow tier (re-set only when its text changes)
 #if defined(HAS_TDECK_GT911)
 static lv_obj_t* s_sleep_diag_lbl  = nullptr;   // Idle-sleep instrumentation label (Lock settings, line 1)
 static lv_obj_t* s_sleep_diag_lbl2 = nullptr;   // Idle-sleep instrumentation label (Lock settings, line 2)
@@ -7927,6 +7928,15 @@ static void radioFemLnaToggleCb(lv_event_t* e) {
   board.setFemLnaEnable(on);
 }
 #endif
+// Buffered LoRa receive (experimental): a drain task lifts each packet out of the
+// radio within ~1 ms so a busy UI thread can't overwrite unread packets (the
+// missed-messages class). Persists + applies live.
+static void radioRxQueueToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  touchPrefsSetRxQueue(on);
+  radio_driver.rxQueueEnable(on);
+}
 static void radioSigPollSaveCb(lv_event_t* e) {
   const lv_event_code_t _c = lv_event_get_code(e);
   if ((_c != LV_EVENT_CLICKED && _c != LV_EVENT_DEFOCUSED) || !s_radio_sig_poll_ta) return;
@@ -8201,6 +8211,18 @@ static void buildRadioSettings() {
                           COLOR_SUB, &g_font_12, 0) + 2;
   }
 #endif
+
+  // Buffered receive (experimental): decouple packet pickup from the UI loop.
+  {
+    int rh = settingsRowLabel(body, y, 4, "Buffered receive (experimental)", COLOR_TEXT, &g_font_12, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (touchPrefsGetRxQueue()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, radioRxQueueToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(34, rh + 10);
+    y += settingsRowLabel(body, y, 0, "Reads packets on a background task so a busy screen can't drop them.",
+                          COLOR_SUB, &g_font_12, 0) + 2;
+  }
 
   // Signal probe — same setting as the home-graph Signal popup. A periodic
   // discover advert keeps the signal bars / graph fresh. Poll interval in whole
@@ -8558,7 +8580,11 @@ struct StallRec { uint32_t at_s; uint16_t dur_ms; const char* tag; };
 extern StallRec g_stall_ring[16];
 extern uint8_t  g_stall_cnt, g_stall_w;
 
-static void sysInfoText(char* buf, size_t cap) {
+// Live tier of the About text: the two blocks that genuinely change every second
+// (uptime + heap). Kept in their own small label so the 1 Hz refresh only re-lays
+// ~7 lines — re-setting the full ~40-line text made LVGL spend ~340 ms per second
+// rendering while About was open (the "ui:lvgl" stall-ring entries).
+static void sysInfoTextLive(char* buf, size_t cap) {
   int p = 0;
 #if defined(ESP32)
   const uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
@@ -8569,19 +8595,6 @@ static void sysInfoText(char* buf, size_t cap) {
   p += snprintf(buf + p, cap - p,
                 "Uptime\n  %ud %02uh %02um %02us\n\n",
                 (unsigned)up_d, (unsigned)up_h, (unsigned)up_m, (unsigned)up_ss);
-
-  esp_chip_info_t chip;
-  esp_chip_info(&chip);
-  const char* model = (chip.model == CHIP_ESP32S3) ? "ESP32-S3"
-                    : (chip.model == CHIP_ESP32S2) ? "ESP32-S2"
-                    : (chip.model == CHIP_ESP32)   ? "ESP32"
-                    : "ESP32-?";
-  p += snprintf(buf + p, cap - p,
-                "Chip\n  %s rev %d, %d core(s)\n  features:%s%s%s\n\n",
-                model, (int)chip.revision, (int)chip.cores,
-                (chip.features & CHIP_FEATURE_BLE)      ? " BLE"  : "",
-                (chip.features & CHIP_FEATURE_WIFI_BGN) ? " WiFi" : "",
-                (chip.features & CHIP_FEATURE_BT)       ? " BT"   : "");
 
   const size_t dram_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   const size_t dram_tot   = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -8595,6 +8608,41 @@ static void sysInfoText(char* buf, size_t cap) {
                 (unsigned)(dram_min  / 1024),
                 (unsigned)(psram_free / 1024),
                 (unsigned)(psram_tot  / 1024));
+
+  // LoRa RX health: DIO1 events vs packets actually read out. late-lost > 0 means
+  // packets completed in the radio but were overwritten before the loop read them
+  // (the missed-messages class); "buffered on" should hold it at zero.
+  const uint32_t rx_evt  = radio_driver.getRxEvents();
+  const uint32_t rx_ok   = radio_driver.getPacketsRecv();
+  const uint32_t rx_err  = radio_driver.getPacketsRecvErrors();
+  const uint32_t rx_lost = (rx_evt > rx_ok + rx_err) ? (rx_evt - rx_ok - rx_err) : 0;
+  p += snprintf(buf + p, cap - p,
+                "LoRa RX\n  heard: %lu  read: %lu  err: %lu\n  late-lost: %lu  qdrop: %lu  buffered: %s\n\n",
+                (unsigned long)rx_evt, (unsigned long)rx_ok, (unsigned long)rx_err,
+                (unsigned long)rx_lost, (unsigned long)radio_driver.getRxQueueDrops(),
+                radio_driver.rxQueueEnabled() ? "on" : "off");
+#endif
+  (void)p; (void)cap;
+}
+
+// Slow tier: changes rarely (an SD scan landing, a new stall entry) or never
+// (chip, flash, reset reason, build). refreshSysInfo() only pushes this to its
+// label when the generated text actually differs from what is displayed.
+static void sysInfoTextRest(char* buf, size_t cap) {
+  int p = 0;
+#if defined(ESP32)
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  const char* model = (chip.model == CHIP_ESP32S3) ? "ESP32-S3"
+                    : (chip.model == CHIP_ESP32S2) ? "ESP32-S2"
+                    : (chip.model == CHIP_ESP32)   ? "ESP32"
+                    : "ESP32-?";
+  p += snprintf(buf + p, cap - p,
+                "Chip\n  %s rev %d, %d core(s)\n  features:%s%s%s\n\n",
+                model, (int)chip.revision, (int)chip.cores,
+                (chip.features & CHIP_FEATURE_BLE)      ? " BLE"  : "",
+                (chip.features & CHIP_FEATURE_WIFI_BGN) ? " WiFi" : "",
+                (chip.features & CHIP_FEATURE_BT)       ? " BT"   : "");
 
   const uint32_t flash_chip_size = ESP.getFlashChipSize();
 #if defined(HAS_TANMATSU)
@@ -8694,17 +8742,24 @@ static void refreshSysInfo(unsigned long now) {
     next = now + 1000;   // not on the About sheet — just rate-limit
     return;
   }
-  // Re-setting an ~800-char label re-wraps + repaints it; doing that every second
-  // WHILE the user drags or flings the page stutters the scroll badly. Hold off
-  // while a pointer is pressed or a scroll/throw is in flight, and re-check soon
-  // so the live uptime/heap resumes the instant they let go.
+  // Re-setting a label re-wraps + repaints it; doing that every second WHILE the
+  // user drags or flings the page stutters the scroll badly. Hold off while a
+  // pointer is pressed or a scroll/throw is in flight, and re-check soon so the
+  // live uptime/heap resumes the instant they let go.
   for (lv_indev_t* in = lv_indev_get_next(nullptr); in; in = lv_indev_get_next(in)) {
     if (lv_indev_get_scroll_dir(in) != LV_DIR_NONE) { next = now + 120; return; }
   }
   next = now + 1000;
-  char buf[800];
-  sysInfoText(buf, sizeof buf);
+  char buf[704];
+  sysInfoTextLive(buf, sizeof buf);
   lv_label_set_text(s_sysinfo_lbl, buf);
+  // Slow tier: pushing identical text would still invalidate + repaint the whole
+  // ~30-line label (~340 ms of LVGL render per pass) — skip unless it changed.
+  if (s_sysinfo_rest_lbl) {
+    sysInfoTextRest(buf, sizeof buf);
+    if (strcmp(lv_label_get_text(s_sysinfo_rest_lbl), buf) != 0)
+      lv_label_set_text(s_sysinfo_rest_lbl, buf);
+  }
 }
 
 #if defined(HAS_TDECK_GT911)
@@ -8740,9 +8795,9 @@ static void refreshSleepDiag(unsigned long now) {
 
 static void buildSystemInfoSettings() {
   lv_obj_t* body = createSettingsModal("System info", SettingsModalKind::SystemInfo);
-  char buf[800];
-  sysInfoText(buf, sizeof buf);
+  char buf[704];
 
+  // Live tier (uptime + heap): a small constant-height label refreshed at 1 Hz.
   lv_obj_t* lbl = lv_label_create(body);
   s_sysinfo_lbl = lbl;
   lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
@@ -8750,13 +8805,26 @@ static void buildSystemInfoSettings() {
   lv_obj_set_pos(lbl, 2, 0);
   lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  sysInfoTextLive(buf, sizeof buf);
   lv_label_set_text(lbl, buf);
 
-  // "Memory detail" button below the info text (per-region heap breakdown).
+  // Slow tier below it: chip/flash/SD/NVS/stalls/build — re-set only on change.
   lv_obj_update_layout(lbl);
+  lv_obj_t* rest = lv_label_create(body);
+  s_sysinfo_rest_lbl = rest;
+  lv_label_set_long_mode(rest, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(rest, lv_pct(100));
+  lv_obj_set_pos(rest, 2, lv_obj_get_y(lbl) + lv_obj_get_height(lbl) + 2);
+  lv_obj_set_style_text_font(rest, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(rest, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  sysInfoTextRest(buf, sizeof buf);
+  lv_label_set_text(rest, buf);
+
+  // "Memory detail" button below the info text (per-region heap breakdown).
+  lv_obj_update_layout(rest);
   lv_obj_t* membtn = lv_btn_create(body);
   lv_obj_set_size(membtn, lv_pct(96), SC(34));
-  lv_obj_set_pos(membtn, 2, lv_obj_get_y(lbl) + lv_obj_get_height(lbl) + 8);
+  lv_obj_set_pos(membtn, 2, lv_obj_get_y(rest) + lv_obj_get_height(rest) + 8);
   styleButton(membtn);
   lv_obj_add_event_cb(membtn, openMemoryDetailCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* mbl = lv_label_create(membtn);
@@ -18215,6 +18283,7 @@ static void spectrumRestoreRadio() {
 
 static void closeSpectrumPage() {
   spectrumRestoreRadio();             // ALWAYS restore before tearing the page down
+  radio_driver.rxQueueSuspend(false); // resume the buffered-receive drain task (no-op if off)
   if (s_spec_timer) { lv_timer_del(s_spec_timer); s_spec_timer = nullptr; }
   if (s_spec_root)  { popupClose(&s_spec_root); }
   s_spec_chart = nullptr; s_spec_ser = nullptr; s_spec_wf = nullptr;
@@ -18239,6 +18308,11 @@ static void spectrumDismissCb(lv_event_t* e) {
 
 static void openSpectrumPage() {
   closeSpectrumPage();
+  // Park the buffered-receive drain task while this page drives the raw radio.
+  // The acquire/release pair guarantees no drain is mid-flight when we take over.
+  radio_driver.radioAcquire();
+  radio_driver.rxQueueSuspend(true);
+  radio_driver.radioRelease();
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
   const int H = sh - STATUSBAR_H;
@@ -24121,7 +24195,7 @@ static void closeSettingsCategory() {
   if (!s_settings_sheet && s_settings_open_cat < 0) return;
   hideKb();
   if (s_settings_open_cat == CAT_ABOUT) {   // null the live-label ptrs (freed with the sheet)
-    s_sysinfo_lbl = nullptr; s_update_about_lbl = nullptr; s_ota_status_lbl = nullptr;
+    s_sysinfo_lbl = nullptr; s_sysinfo_rest_lbl = nullptr; s_update_about_lbl = nullptr; s_ota_status_lbl = nullptr;
     s_ota_btn = nullptr; s_ota_btn_lbl = nullptr;
     s_ota_prev_btn = nullptr;
     g_lv.settings_status = nullptr; g_lv.diag_id_label = nullptr; g_lv.diag_label = nullptr;
@@ -35548,6 +35622,9 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     // matching the hardware). No-op on a V4.2 board (femLnaControllable() == false).
     if (board.femLnaControllable()) board.setFemLnaEnable(touchPrefsGetFemLna());
 #endif
+
+    // Buffered LoRa receive (experimental, default OFF): apply the saved opt-in.
+    if (touchPrefsGetRxQueue()) radio_driver.rxQueueEnable(true);
 
     buildUiTree();
 

@@ -2539,7 +2539,11 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 }
 
 void MyMesh::applyRadioFromPrefs() {
+  // setParams is a multi-step SPI sequence; hold the radio against the buffered-
+  // receive drain task so it can't re-arm RX between the steps (no-op when off).
+  radio_driver.radioAcquire();
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  radio_driver.radioRelease();
   radio_driver.setTxPower(_prefs.tx_power_dbm);
 #if defined(USE_SX1262) || defined(USE_SX1268)
   _prefs.rx_boosted_gain = _prefs.rx_boosted_gain ? 1 : 0;
@@ -3338,10 +3342,12 @@ void MyMesh::handleCmdFrame(size_t len) {
       _prefs.client_repeat = repeat;
       savePrefs();
 
+      radio_driver.radioAcquire();   // hold off the RX drain task mid-sequence (no-op when off)
       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
 #if defined(USE_SX1262) || defined(USE_SX1268) || defined(SX126X_RX_BOOSTED_GAIN)
       radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain != 0);
 #endif
+      radio_driver.radioRelease();
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 

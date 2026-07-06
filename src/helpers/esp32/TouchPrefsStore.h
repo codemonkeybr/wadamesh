@@ -157,6 +157,12 @@ bool    touchPrefsSetBootAdvert(bool on);
  * bubbles, so far more history fits on screen. Opt-in, default off (bubbles). */
 bool    touchPrefsGetCompactChat();
 bool    touchPrefsSetCompactChat(bool on);
+
+/* Buffered LoRa receive (experimental): a high-priority drain task lifts each packet
+ * out of the radio within ~1 ms so UI-thread stalls can't overwrite unread packets
+ * (the missed-messages class). Opt-in, default off = stock receive path. */
+bool    touchPrefsGetRxQueue();
+bool    touchPrefsSetRxQueue(bool on);
 uint32_t touchPrefsGetClockFloor();               // monotonic send-timestamp floor (#89)
 bool    touchPrefsSetClockFloor(uint32_t epoch);  // only ever grows; no-op below current
 

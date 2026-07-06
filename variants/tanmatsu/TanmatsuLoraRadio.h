@@ -36,6 +36,17 @@ public:
   void idle();                                             // → standby (RadioLibWrapper::idle)
   uint32_t getPacketsRecvErrors() const { return _n_recv_errors; }
 
+  // Buffered-receive API parity with RadioLibWrapper — no-op stubs. This bridge
+  // drains the remote radio its own way; the S3 drain-task feature does not map
+  // onto it, but shared UI/mesh code calls these unguarded.
+  void     rxQueueEnable(bool) {}
+  bool     rxQueueEnabled() const { return false; }
+  void     rxQueueSuspend(bool) {}
+  void     radioAcquire() {}
+  void     radioRelease() {}
+  uint32_t getRxEvents() const { return _n_recv + _n_recv_errors; }
+  uint32_t getRxQueueDrops() const { return 0; }
+
   // --- mesh::Radio contract (Dispatcher.h) ---
   void     begin() override {}                             // lifecycle hook; remote radio is RX-ready after init()
   int      recvRaw(uint8_t* bytes, int sz) override;       // drain one RX packet, 0 if none
