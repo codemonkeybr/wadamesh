@@ -18752,9 +18752,10 @@ static void makeHome(lv_obj_t* tab) {
   lv_obj_set_ext_click_area(s_home_chart_legend, 8);
   lv_obj_add_event_cb(s_home_chart_legend, homeChartClickedCb, LV_EVENT_CLICKED, nullptr);
 
-#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
-  // Landscape (T-Deck / Tanmatsu): the right column holds Advert + Terminal + Files + Apps,
-  // so the chart must stop short of that strip — else it draws over the buttons.
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU) || defined(TLORA_PAGER)
+  // Landscape (T-Deck / Tanmatsu / pager): the right column holds Advert + Terminal +
+  // Files/Apps + Control, so the chart must stop short of that strip — else it draws
+  // over the buttons.
   const int chart_w = home_land ? (cw - RSTRIP) : cw;
 #else
   const int chart_w = cw;
