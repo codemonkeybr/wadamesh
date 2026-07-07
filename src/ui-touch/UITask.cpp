@@ -26948,7 +26948,19 @@ static void updatePagerEncoder(unsigned long now) {
     s_press_start = now;
     s_long_fired  = false;
   } else if (held && !s_long_fired && (now - s_press_start) >= kLongPressMs) {
-    navPushTap(LV_KEY_ESC);
+    // "Back", extending the T-Deck/Tanmatsu back-key ladder: a popup/sheet on top
+    // closes first, then an open chat/channel detail. Unlike those boards, the
+    // pager has no dedicated Home hotkey (T-Deck/Tanmatsu reach Home via their
+    // own programmable/coloured keys, not this "back" key) and the bottom tab
+    // bar is deliberately not a nav-group target, so a BARE main tab (Chats,
+    // Contacts, Map, Settings, …) had no way back to Home at all. Fall back to
+    // Home before plain ESC — matches every other "close" path in this app
+    // (the Terminal/Files Home button, the fullscreen-view popup closer) already
+    // landing on Home rather than a real back-stack.
+    if (anyPopupOpen())                            hwKeyDismissTopPopup();
+    else if (LvChatPanel* cp = navOpenChatPanel()) closeChatPanel(cp);
+    else if (getActiveTab() != HOME_TAB_INDEX)     navGoToMainTab(HOME_TAB_INDEX);
+    else                                           navPushTap(LV_KEY_ESC);
     s_long_fired = true;
   } else if (!held && s_was_held && !s_long_fired) {
     navPushTap(LV_KEY_ENTER);   // released before the long-press threshold -> short click
@@ -37841,7 +37853,7 @@ static const PopupEnt k_popup_registry[] = {
   { P_OPEN(s_local_sensors_root),    []{ closeLocalSensorsPage(); },      PF_COUNT },   // was in no registry at all
 #endif
   { P_OPEN(s_siginfo_root),          []{ closeSigInfoPopup(); },          PF_COUNT },
-#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU) || defined(TLORA_PAGER)
   { P_OPEN(s_fm_img_root),           []{ fmImageClose(); },               PF_COUNT },
   { P_OPEN(s_editor_root),           []{ fmEditorClose(); },              PF_COUNT },
   { P_OPEN(s_fm_prompt),             []{ fmPromptClose(); },              PF_COUNT },
