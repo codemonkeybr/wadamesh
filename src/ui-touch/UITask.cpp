@@ -29104,6 +29104,25 @@ static void tanBeep() {
   size_t wr = 0;
   i2s_channel_write(h, buf, (size_t)n * 2 * sizeof(int16_t), &wr, 200 / portTICK_PERIOD_MS);
 }
+#elif defined(HAS_THINKNODE_M9)
+// M9: BL_EN (GPIO17) is a PNP transistor gate. LEDC PWM confirmed working on hardware
+// (Specter bring-up), but the duty is INVERTED — lower duty on the base = MORE conduction
+// = brighter. 5kHz confirmed clean; the transistor couldn't keep up at very low frequencies.
+#define HAS_CC_BRIGHTNESS 1
+static uint8_t s_brightness_pct = 100;
+static bool    s_bl_pwm_ready   = false;
+constexpr int  kM9BlPwmChannel  = 7;   // separate channel from the generic LEDA_CTL block above
+static void applyBrightness(uint8_t pct) {
+  if (pct < 5)   pct = 5;
+  if (pct > 100) pct = 100;
+  s_brightness_pct = pct;
+  if (!s_bl_pwm_ready) {
+    ledcSetup(kM9BlPwmChannel, 5000, 8);            // 5kHz, 8-bit — confirmed clean on the PNP
+    ledcAttachPin(PIN_TFT_BL_EN, kM9BlPwmChannel);  // takes the pin over from board.backlight's digitalWrite
+    s_bl_pwm_ready = true;
+  }
+  ledcWrite(kM9BlPwmChannel, (uint32_t)(100 - pct) * 255u / 100u);   // inverted duty
+}
 #endif
 
 #if defined(HAS_CC_BRIGHTNESS)
@@ -36614,10 +36633,11 @@ static inline void touchScreenBacklight(bool on) {
   if (on) applyBrightness(s_brightness_pct);
   else    bsp_display_set_backlight_brightness(0);
 #elif defined(HAS_THINKNODE_M9)
-  // M9's backlight is a simple ref-counted GPIO (GPIO17, active-LOW PNP) — no PWM dimming,
-  // just on/off. Goes through m9SetBacklight() (target.cpp) rather than a raw digitalWrite
-  // so it stays in sync with the ref-count M9Board::begin() already holds a claim on at boot.
-  m9SetBacklight(on);
+  // M9: BL_EN (GPIO17) drives a PNP transistor gate — LEDC PWM works (confirmed on hardware,
+  // Specter bring-up), but duty is INVERTED vs. a normal N-channel/NPN setup: lower duty on
+  // the base = MORE conduction = brighter. applyBrightness() below already accounts for this.
+  if (on) applyBrightness(s_brightness_pct);
+  else    ledcWrite(kM9BlPwmChannel, 255);   // inverted: 255 = 0% conduction = off
 #else
   (void)on;
 #endif
