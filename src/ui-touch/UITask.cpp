@@ -2429,7 +2429,8 @@ static void navFocusCb(lv_group_t* g) {
     lv_obj_set_style_bg_color(f, lv_color_hex(COLOR_TEXT), LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_bg_opa(f, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_text_color(f, lv_color_hex(COLOR_BG), LV_PART_ITEMS | LV_STATE_CHECKED);
-  } else if (lv_obj_check_type(f, &lv_switch_class) || lv_obj_check_type(f, &lv_slider_class)) {
+  } else if (lv_obj_check_type(f, &lv_switch_class) || lv_obj_check_type(f, &lv_slider_class) 
+            || lv_obj_check_type(f, &lv_textarea_class)) {
     // A switch/slider's look is its knob/indicator, not the MAIN bg, so a reverse-video
     // fill doesn't read as focused — give it a bright outline PLUS an accent glow instead.
     s_nav_sv.bg_c = s_nav_sv.bg_o = s_nav_sv.txt = false;   // nothing to restore but the outline/shadow
