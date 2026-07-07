@@ -2589,22 +2589,51 @@ static void navFindScrollableRec(lv_obj_t* o, bool up, lv_obj_t** best, long* be
 // scroll (or the focus isn't inside a scroll area), fall back to the biggest scrollable
 // page on the active screen — so the scroll keys ALWAYS move the page.
 static bool navMapZoomIfActive(bool zoom_in);   // defined with the map zoom code below
-static void navScrollFocused(bool up) {
+// Returns the container it scrolled (or null if the map-zoom shortcut fired / nothing
+// scrollable was found) — callers that need to relocate focus afterward use this instead
+// of re-deriving the container themselves (see navRefocusFirstVisible()'s callers).
+static lv_obj_t* navScrollFocused(bool up) {
   // On the Map tab the scroll keys zoom instead (F/C on the T-Deck, F/V on the
   // Tanmatsu — scroll-up = zoom in, like a mouse wheel on any map). The map has
   // nothing to scroll, so the keys were dead weight there (wyvern.red feedback).
-  if (navMapZoomIfActive(up)) return;
+  if (navMapZoomIfActive(up)) return nullptr;
   lv_obj_t* o = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
   for (lv_obj_t* p = o; p; p = lv_obj_get_parent(p)) {
     if (!lv_obj_has_flag(p, LV_OBJ_FLAG_SCROLLABLE)) continue;
     const lv_coord_t room = up ? lv_obj_get_scroll_top(p) : lv_obj_get_scroll_bottom(p);
     if (room <= 0) continue;   // nothing to scroll that way here — try the next ancestor
     navScrollBy(p, up);
-    return;
+    return p;
   }
   lv_obj_t* best = nullptr; long bestArea = 0;   // fallback: scroll the page regardless of focus
   navFindScrollableRec(lv_scr_act(), up, &best, &bestArea);
   if (best) navScrollBy(best, up);
+  return best;
+}
+// Simple ancestor walk with no "room to scroll" gate — used only to relocate a container
+// for a post-scroll refocus, where direction no longer matters.
+static lv_obj_t* navNearestScrollableAncestor(lv_obj_t* start) {
+  for (lv_obj_t* p = start; p; p = lv_obj_get_parent(p))
+    if (lv_obj_has_flag(p, LV_OBJ_FLAG_SCROLLABLE)) return p;
+  return nullptr;
+}
+// After a free-scroll with no explicit focus target, snap focus to whatever's nearest the
+// top of the now-visible viewport — mirrors how a touch drag leaves focus alone until you
+// tap something, but this device has no touch fallback, so plain NEXT/PREV needs a sane
+// resume point instead of staying stuck on a focus that scrolled off-glass.
+static void navRefocusFirstVisible(lv_obj_t* p) {
+  if (!p || !s_nav_group) return;
+  lv_area_t pa; lv_obj_get_coords(p, &pa);
+  const int n = s_nav_count < kNavMax ? s_nav_count : kNavMax;
+  lv_obj_t* best = nullptr; int32_t bestY = 0x7FFFFFFF;   // lv_coord_t is 16-bit; would overflow this sentinel
+  for (int i = 0; i < n; i++) {
+    lv_obj_t* o = s_nav_objs[i];
+    if (!o || !lv_obj_is_valid(o) || lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) continue;
+    lv_area_t oa; lv_obj_get_coords(o, &oa);
+    if (oa.y1 < pa.y1 || oa.y1 > pa.y2) continue;   // not at/below the container's own top edge
+    if (oa.y1 < bestY) { bestY = oa.y1; best = o; }
+  }
+  if (best) { s_nav_show = true; lv_group_focus_obj(best); }
 }
 // Small key hints over each menubar icon — shown only while keyboard nav is on.
 static void navMenubarKeysSync() {
@@ -3112,6 +3141,17 @@ static bool navTopHasVisibleChild(lv_obj_t* top) {
     if (c && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) && !lv_obj_has_flag(c, NAV_SKIP_FLAG)) return true;
   }
   return false;
+}
+
+// True only at the top level — no modal/popup on lv_layer_top(), no settings detail
+// sheet, no open chat/channel. Scopes the pager's Alt+encoder gesture (updatePagerEncoder):
+// tab-switching only makes sense here; inside a nested scrollable screen the same
+// gesture instead free-scrolls the page.
+static bool navOnMainPage() {
+  if (navTopHasVisibleChild(lv_layer_top())) return false;
+  if (s_settings_sheet && lv_obj_is_valid(s_settings_sheet)) return false;
+  if (navOpenChatPanel()) return false;
+  return true;
 }
 
 // Some fullscreen views (Terminal, File manager) build their OWN popups (command
@@ -26943,7 +26983,7 @@ static void updatePagerEncoder(unsigned long now) {
   // matching TLORA_PAGER fix) and the screen dimmed mid-use.
   if ((delta != 0 || held) && g_lv.task) g_lv.task->noteUserInput();
 
-  if (pagerKeyboardAltHeld()) {
+  if (pagerKeyboardAltHeld() && navOnMainPage()) {
     // Alt (the bottom-left orange key, otherwise a hold-only modifier for the
     // keyboard's symbol layer — free to reuse here since it types nothing on
     // its own) + turn jumps directly between the 5 main tabs (Chats/Contacts/
@@ -26951,9 +26991,31 @@ static void updatePagerEncoder(unsigned long now) {
     // focus target (same as T-Deck/Tanmatsu), and unlike those boards the
     // pager has no separate dedicated hotkeys to reach it, so plain turning
     // could otherwise only ever move focus WITHIN the current screen —
-    // reported: the tab bar icons were unreachable from Home.
+    // reported: the tab bar icons were unreachable from Home. Scoped to the
+    // main-tab level (navOnMainPage()) — reported bug: this used to fire even
+    // inside a settings sheet/chat, silently abandoning it to jump tabs.
     for (; delta > 0; delta--) navSwitchTab(+1);
     for (; delta < 0; delta++) navSwitchTab(-1);
+  } else if (pagerKeyboardAltHeld()) {
+    // Inside a nested scrollable screen (settings detail sheet, chat, modal): Alt+turn
+    // free-scrolls the page instead, like a touch drag. The keyboard-nav scroll-into-view
+    // path (navFocusCb's lv_obj_scroll_to_view with LV_ANIM_OFF) doesn't reliably repaint
+    // on this board — confirmed on hardware: focus and blur-to-save side effects reach
+    // fields far down a page, but the glass keeps showing the old scroll position.
+    // navScrollFocused()'s ANIMATED lv_obj_scroll_by should sidestep that: LVGL's anim
+    // timer re-invalidates every tick instead of relying on a single one-shot invalidate,
+    // the same reason touch-drag scrolling on the other boards never showed this bug.
+    // After the turn, snap focus to whatever's now nearest the top of the visible
+    // viewport so plain NEXT/PREV resumes from a sane, visible spot instead of a focus
+    // stuck off-glass.
+    const bool scrolled = (delta != 0);
+    lv_obj_t* container = nullptr;
+    for (; delta > 0; delta--) container = navScrollFocused(false);
+    for (; delta < 0; delta++) container = navScrollFocused(true);
+    if (scrolled) {
+      if (!container) container = navNearestScrollableAncestor(lv_group_get_focused(s_nav_group));
+      if (container) navRefocusFirstVisible(container);
+    }
   } else {
     for (; delta > 0; delta--) navPushTap(LV_KEY_NEXT);
     for (; delta < 0; delta++) navPushTap(LV_KEY_PREV);

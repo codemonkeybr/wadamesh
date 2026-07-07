@@ -61,7 +61,12 @@ int pagerEncoderReadDelta() {
   int32_t raw = s_raw_delta;
   s_raw_delta = raw % PAGER_ENCODER_STEPS_PER_DETENT;   // keep the partial-detent remainder
   interrupts();
-  return (int)(raw / PAGER_ENCODER_STEPS_PER_DETENT);
+  // Confirmed inverted on hardware (2026-07-07): kQuadTable's CW/CCW sign convention
+  // doesn't match this physical part's wiring -- turning the knob the way a user expects
+  // to move forward/down moved focus and page-scroll backward/up instead. Negate here
+  // (not the table) so every consumer (nav NEXT/PREV, Alt+turn tab-switch, Alt+turn page
+  // scroll) inherits the corrected sense from one place.
+  return -(int)(raw / PAGER_ENCODER_STEPS_PER_DETENT);
 }
 
 bool pagerEncoderClickHeld() {
