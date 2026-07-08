@@ -62,4 +62,11 @@ bool pagerKeyboardConsumeAltTap();
  *  (e.g. UITask's press-and-hold "back" gesture). */
 bool pagerKeyboardBackspaceHeld();
 
+/** True while Space is physically held (raw state, mirrors
+ *  pagerKeyboardBackspaceHeld()). A press still immediately ring-pushes ' '
+ *  as before, so normal typing is unaffected; this is for callers that want
+ *  to detect a long hold separately (e.g. UITask's press-and-hold
+ *  "lock screen" gesture). */
+bool pagerKeyboardSpaceHeld();
+
 #endif

@@ -42,6 +42,7 @@ static constexpr char s_symbolMap[KB_ROWS][KB_COLS] = {
 static constexpr uint8_t kAltPos       = 2 * KB_COLS + 0; // row2,col0 ('\0' in both layers)
 static constexpr uint8_t kCapsPos      = 2 * KB_COLS + 8; // row2,col8 ('\0' in both layers)
 static constexpr uint8_t kBackspacePos = 2 * KB_COLS + 9; // row2,col9 ('\0' in both layers)
+static constexpr uint8_t kSpacePos     = 3 * KB_COLS + 0; // row3,col0 (' ' in both layers)
 
 static Adafruit_TCA8418 s_kb;
 static bool s_inited = false;
@@ -50,6 +51,7 @@ static bool s_alt_used = false;         // Alt consumed as a modifier since it w
 static bool s_alt_tap_pending = false;  // Alt pressed+released with nothing else happening meanwhile
 static bool s_caps = false;
 static bool s_backspace_held = false;
+static bool s_space_held = false;
 
 // Single-producer (poll) / single-consumer (UI thread) ring — same pattern as
 // TDeckKeyboard.cpp; byte indices are atomic enough for SPSC without a lock.
@@ -106,6 +108,7 @@ void pagerKeyboardPoll() {
     if (s_alt && pressed) s_alt_used = true;
     if (code == kCapsPos) { if (pressed) s_caps = !s_caps; continue; }
     if (code == kBackspacePos) { s_backspace_held = pressed; if (pressed) ringPush('\b'); continue; }
+    if (code == kSpacePos) { s_space_held = pressed; if (pressed) ringPush(' '); continue; }
     if (!pressed) continue;   // base/symbol keys only emit on press
 
     const uint8_t row = code / KB_COLS;
@@ -146,5 +149,7 @@ bool pagerKeyboardConsumeAltTap() {
 }
 
 bool pagerKeyboardBackspaceHeld() { return s_backspace_held; }
+
+bool pagerKeyboardSpaceHeld() { return s_space_held; }
 
 #endif

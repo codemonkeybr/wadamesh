@@ -9241,6 +9241,8 @@ static void lockOnScreenOffToggleCb(lv_event_t* e) {
   const char* unlock_hint = on ? TR("Locks when screen off\n(hold the trackball to unlock)") : TR("Screen-off just dims");
 #elif defined(HAS_TANMATSU)
   const char* unlock_hint = on ? TR("Locks when screen off\n(press Volume Down to unlock)") : TR("Screen-off just dims");
+#elif defined(TLORA_PAGER)
+  const char* unlock_hint = on ? TR("Locks when screen off\n(hold Backspace to unlock)") : TR("Screen-off just dims");
 #else
   const char* unlock_hint = on ? TR("Locks when screen off\n(press the button to unlock)") : TR("Screen-off just dims");
 #endif
@@ -27188,6 +27190,118 @@ static void updatePagerAltTapNext() {
   navPushTap(LV_KEY_NEXT);
   if (g_lv.task) g_lv.task->noteUserInput();
 }
+
+// ---- Spacebar hold-to-lock (mirrors the T-Deck's spacebar lock) -------------
+// The T-Deck keyboard can't detect a real key-up, so it fakes a hold with a
+// press-then-1s-countdown; the TCA8418 here reports genuine press/release, so
+// this is an actual hold, timed the same as pagerNavGoBack()'s gestures, with
+// a live progress bar (T-Deck shows a 3-2-1 countdown instead since its lock
+// isn't a real hold).
+static lv_obj_t* s_pager_locking_popup = nullptr;
+static lv_obj_t* s_pager_locking_bar   = nullptr;
+
+static void pagerLockingPopupHide() {
+  if (s_pager_locking_popup) { popupClose(&s_pager_locking_popup); s_pager_locking_bar = nullptr; }
+}
+static void pagerLockingPopupShow() {
+  if (s_pager_locking_popup) return;
+  s_pager_locking_popup = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_pager_locking_popup);
+  lv_obj_set_size(s_pager_locking_popup, lv_disp_get_hor_res(nullptr), lv_disp_get_ver_res(nullptr) - STATUSBAR_H);
+  lv_obj_set_pos(s_pager_locking_popup, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_pager_locking_popup, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_pager_locking_popup, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_pager_locking_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* card = lv_obj_create(s_pager_locking_popup);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, 180, 74);
+  lv_obj_center(card);
+  lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* t = lv_label_create(card);
+  lv_label_set_text(t, TR("Locking\xE2\x80\xA6"));   // Locking…
+  lv_obj_set_style_text_color(t, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(t, &g_font_16, LV_PART_MAIN);
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 8);
+
+  s_pager_locking_bar = lv_bar_create(card);
+  lv_obj_set_size(s_pager_locking_bar, 140, 8);
+  lv_obj_align(s_pager_locking_bar, LV_ALIGN_BOTTOM_MID, 0, -14);
+  lv_obj_set_style_bg_color(s_pager_locking_bar, lv_color_hex(0x2A2D31), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_pager_locking_bar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_pager_locking_bar, lv_color_hex(COLOR_ACCENT), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(s_pager_locking_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_bar_set_range(s_pager_locking_bar, 0, 1000);
+  lv_bar_set_value(s_pager_locking_bar, 0, LV_ANIM_OFF);
+}
+
+static void updatePagerSpaceHold(unsigned long now) {
+  // Never engage mid-typing (space just types normally there) or once already
+  // locked/off (nothing left to do -- updatePagerBackspaceUnlockHold owns the
+  // reverse direction).
+  if ((g_lv.task && (g_lv.task->isScreenOff() || g_lv.task->isManualLock())) || navFocusedTextarea()) {
+    pagerLockingPopupHide();
+    return;
+  }
+  const bool held = pagerKeyboardSpaceHeld();
+  static constexpr uint32_t kLongPressMs = 1000;
+  static bool     s_was_held    = false;
+  static uint32_t s_press_start = 0;
+  static bool     s_long_fired  = false;
+
+  if (held && !s_was_held) {
+    s_press_start = now;
+    s_long_fired  = false;
+  } else if (held && !s_long_fired) {
+    const uint32_t elapsed = now - s_press_start;
+    // A bare space tap is otherwise a total no-op here (unfocused, no field) --
+    // hold off showing the popup for a beat so an ordinary quick tap doesn't
+    // flash it on and off.
+    if (elapsed >= 150) {
+      pagerLockingPopupShow();
+      if (s_pager_locking_bar) lv_bar_set_value(s_pager_locking_bar, elapsed > kLongPressMs ? kLongPressMs : elapsed, LV_ANIM_OFF);
+    }
+    if (elapsed >= kLongPressMs) {
+      s_long_fired = true;
+      pagerLockingPopupHide();
+      if (g_lv.task) g_lv.task->lockScreen();
+    }
+  } else if (!held) {
+    pagerLockingPopupHide();
+  }
+  s_was_held = held;
+}
+
+// ---- Backspace hold-to-unlock (mirrors the T-Deck's trackball hold-to-
+// unlock) -- only meaningful while hard-locked, so it never conflicts with
+// updatePagerBackspaceHold()'s "back" gesture above (that one already exits
+// early whenever the screen is off, and lockScreen() never sets _manual_lock
+// without also turning the screen off, so the two are mutually exclusive).
+// Must NOT early-return on isScreenOff() -- unlike every other pager input
+// poller, this one has to keep working while the screen is dark, since that's
+// exactly the state it's meant to end.
+static void updatePagerBackspaceUnlockHold(unsigned long now) {
+  if (!g_lv.task || !g_lv.task->isManualLock()) return;
+  const bool held = pagerKeyboardBackspaceHeld();
+  static constexpr uint32_t kLongPressMs = 1000;
+  static bool     s_was_held    = false;
+  static uint32_t s_press_start = 0;
+
+  if (held && !s_was_held) {
+    s_press_start = now;
+  } else if (held && (now - s_press_start) >= kLongPressMs) {
+    g_lv.task->unlockScreen();
+    s_was_held = false;   // consume -- don't immediately re-trigger were this called again while still held
+    return;
+  }
+  s_was_held = held;
+}
 #endif
 
 #if defined(HAS_PAGER_ENCODER)
@@ -27215,7 +27329,10 @@ static void updatePagerEncoder(unsigned long now) {
   // bug: waking via the encoder button selected "Skip" on the setup
   // wizard's welcome screen the instant the screen lit up.
   if (g_lv.task && g_lv.task->isScreenOff()) {
-    if (delta != 0) g_lv.task->wakeScreen();
+    // Hard-locked: a plain turn must NOT wake/unlock -- only holding Backspace
+    // does (updatePagerBackspaceUnlockHold). Without this gate any idle turn
+    // of the knob bypassed the lock entirely.
+    if (delta != 0 && !g_lv.task->isManualLock()) g_lv.task->wakeScreen();
     return;
   }
   // Screen already on: turning/clicking the encoder is real activity too, same as a
@@ -27548,6 +27665,12 @@ static void lockscreenShow() {
   lv_obj_t* hint = lv_label_create(s_lock_root);
 #if defined(HAS_TANMATSU)
   lv_label_set_text(hint, TR("press Volume Down to unlock"));
+#elif defined(HAS_PAGER_KEYBOARD)
+  // Defensive only -- lockscreenShow() is never actually called on this board
+  // today (its callers are all HAS_TDECK_GT911-gated); the pager's own lock
+  // uses the plain off+wake path with no overlay, per updatePagerSpaceHold()/
+  // updatePagerBackspaceUnlockHold(). Kept correct in case that changes.
+  lv_label_set_text(hint, TR("hold Backspace to unlock"));
 #else
   lv_label_set_text(hint, TR("hold the trackball to unlock"));
 #endif
@@ -37639,8 +37762,18 @@ void UITask::loop() {
 #else
     if (v == LOW && s_user_btn_prev == HIGH) {
       if (_screen_off) {
+#if defined(TLORA_PAGER)
+        /* Pager only: hard-locked means BOOT is a no-op -- holding Backspace
+         * is the deliberate unlock gesture (updatePagerBackspaceUnlockHold).
+         * A plain idle-dimmed (not manually locked) screen still wakes on
+         * BOOT exactly as before. NOT applied to the V4 below (#else of this
+         * #if), which has no keyboard -- BOOT is its only lock/unlock control
+         * and must keep instantly unlocking it. */
+        if (!_manual_lock) wakeScreen();
+#else
         /* wakeScreen() clears _manual_lock so subsequent touches work. */
         wakeScreen();
+#endif
       } else {
         touchScreenBacklight(false);
         setCpuForScreen(false);
@@ -37914,13 +38047,16 @@ void UITask::loop() {
   serviceLockscreen();            // refresh the lock-screen clock on minute roll-over
   serviceLockingCountdown(now);   // advance / fire the spacebar "Locking…" countdown
 #elif defined(HAS_PAGER_KEYBOARD)
-  // Simpler than the T-Deck's: no keyboard-backlight-mode timer or spacebar-lock
-  // countdown wiring yet (pagerKeyboardSetBacklight() exists but isn't hooked up
-  // here, and this board's lock trigger -- if any -- isn't the spacebar, which
-  // is a real typing key on a full QWERTY, unlike the T-Deck's sparse layout).
-  // No separate core-0 touch task to own the I2C bus either (no touch at all),
-  // so poll and drain right here, once per tick.
+  // Simpler than the T-Deck's: no keyboard-backlight-mode timer wiring yet
+  // (pagerKeyboardSetBacklight() exists but isn't hooked up here). No separate
+  // core-0 touch task to own the I2C bus either (no touch at all), so poll and
+  // drain right here, once per tick. Space press-and-hold locks the screen
+  // (updatePagerSpaceHold); Backspace press-and-hold unlocks it again
+  // (updatePagerBackspaceUnlockHold) -- the latter must run unconditionally,
+  // BEFORE the isScreenOff() split below, since it has to keep working while
+  // the screen is dark.
   pagerKeyboardPoll();
+  updatePagerBackspaceUnlockHold(now);
   if (g_lv.task && g_lv.task->isScreenOff()) {
     // Same rationale as updatePagerEncoder(): no touch/trackball wake path on
     // this board, so a keypress while idle-dimmed just wakes the screen
@@ -37937,7 +38073,9 @@ void UITask::loop() {
     // Discard any Alt tap picked up while idle-dimmed -- it must not fire
     // updatePagerAltTapNext()'s NEXT the instant the screen wakes.
     pagerKeyboardConsumeAltTap();
-    if (any) g_lv.task->wakeScreen();
+    // Hard-locked: an ordinary keypress must NOT wake/unlock -- only holding
+    // Backspace does (updatePagerBackspaceUnlockHold, already polled above).
+    if (any && !g_lv.task->isManualLock()) g_lv.task->wakeScreen();
   } else {
     for (int kbi = 0; kbi < 12; ++kbi) {
       int key = pagerKeyboardReadKey();
@@ -37946,6 +38084,7 @@ void UITask::loop() {
     }
     updatePagerAltTapNext();
     updatePagerBackspaceHold(now);
+    updatePagerSpaceHold(now);
   }
 #endif
 #if defined(HAS_TANMATSU)
