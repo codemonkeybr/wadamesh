@@ -29484,6 +29484,14 @@ static void openControlCenter() {
   lv_obj_set_size(card, card_w, 384);   // bigger: header + 3 roomier sliders + toggle grid + sysinfo
 #elif defined(HAS_TDECK_GT911)
   lv_obj_set_size(card, card_w, 200);   // sysinfo + thin brightness slider + 2-row toggle grid (fits 240−22 screen)
+#elif defined(TLORA_PAGER)
+  // 222-px-tall screen: the shared V4/T-Deck-landscape 212px card below is
+  // tuned for a 240px-tall screen (212 + the card's own 4px y-offset = 216,
+  // fits under a 218px root there) -- on the pager's shorter 222px screen that
+  // same card overflows the 200px root by 16px, pushing the toggle row/sysinfo
+  // text off the bottom of the physical display. Size from the actual
+  // available height instead of the shared constant, with a small margin.
+  lv_obj_set_size(card, card_w, sh - STATUSBAR_H - 4 - 6);
 #else
   // Portrait has headroom on the 320-tall screen; make the card taller so the
   // brightness slider + toggles + sysinfo all get their own rows.
@@ -29690,8 +29698,10 @@ static void openControlCenter() {
   lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
   lv_obj_set_style_pad_row(row, 4, LV_PART_MAIN);
 #else
-  // V4: up to 5 chips (Wi-Fi/BT/GPS/Theme/Sound) in one row, sized to fit width.
-  // WRAP as a safety net so they never overflow the (narrow, in portrait) card.
+  // V4/pager: up to 6 chips (Wi-Fi/BT/GPS/Theme/Keyboard/Sound) in one row,
+  // sized to fit width (chip width is computed from the actual count below,
+  // not hardcoded, since which chips appear varies per board). WRAP as a
+  // safety net so they never overflow the (narrow, in portrait) card.
   lv_obj_set_size(row, card_w - 20, 54);
   lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
   lv_obj_set_style_pad_column(row, 5, LV_PART_MAIN);
@@ -29701,8 +29711,8 @@ static void openControlCenter() {
   lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
   const bool gps_on = g_lv.task && g_lv.task->getGPSState();
-  // T-Deck: chips in a 2-row grid. V4: up to 5 chips sized to fit the card width
-  // with even gaps (5 chips + 4 gaps across the content width).
+  // T-Deck: chips in a 2-row grid. V4/pager: chips sized to fit the card width
+  // with even gaps, divisor derived from the actual chip count below.
   int tw = 66, th = 54;
 #if defined(HAS_TANMATSU)
   tw = (card_w - 20 - 20) / 3;   // 3 chips per row (Wi-Fi/BT/GPS/Theme/Keys/Sound → 2×3 grid)
@@ -29711,7 +29721,21 @@ static void openControlCenter() {
 #elif defined(HAS_TDECK_GT911)
   tw = 58; th = 36;
 #else
-  tw = (card_w - 20 - 4 * 5) / 5;   // 5 chips (Wi-Fi/BT/GPS/Theme/Sound) + 4 gaps
+  // Count only the chips this board/session will actually add below, so the
+  // width doesn't assume a fixed chip count -- which chips appear varies per
+  // board (V4 has no Keyboard chip; only HAS_UI_SOUND boards get a Sound
+  // chip), so a hardcoded divisor silently overflows this row and wraps
+  // extra chips onto a clipped 2nd line under the fixed 54px height.
+  int chip_count = 2;   // Wi-Fi, Theme always shown
+  if (!g_lv.task || g_lv.task->hasBleCapability()) chip_count++;   // BT
+  chip_count++;   // GPS (toggle or info-only, always shown)
+#if CAP_KEYBOARD
+  chip_count++;
+#endif
+#if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
+  chip_count++;
+#endif
+  tw = (card_w - 20 - 5 * (chip_count - 1)) / chip_count;   // 5px gap, matches row's pad_column above
   if (tw > 76) tw = 76;
 #endif
   // Each chip: tap = toggle, long-press = jump to that feature's settings page
