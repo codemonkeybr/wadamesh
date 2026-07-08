@@ -28465,6 +28465,20 @@ static void handleHwKey(int key) {
       if (g_lv.task) g_lv.task->noteUserInput();
       return;
     }
+    // Slider nudge: this board has no touch/trackball to drag a slider's
+    // knob, so a focused lv_slider (Control Center brightness, a Settings
+    // slider, the Map zoom bar, …) is otherwise stuck at whatever value it
+    // opened with. D/F reuse navMoveDir()'s existing slider-capture branch
+    // (proportional ~20-presses-end-to-end step, live update + persist) —
+    // the same adjustment the T-Deck trackball's LEFT/RIGHT already does —
+    // rather than a fixed step that's wrong for every slider's range.
+    if (key == 'd' || key == 'D' || key == 'f' || key == 'F') {
+      lv_obj_t* focused = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
+      if (focused && lv_obj_check_type(focused, &lv_slider_class)) {
+        navMoveDir((key == 'd' || key == 'D') ? NAV_RIGHT : NAV_LEFT);
+        return;
+      }
+    }
 #endif
 #if CAP_TRACKBALL
     // A field is focused but we're in navigate mode: select/Enter starts editing it, so the
