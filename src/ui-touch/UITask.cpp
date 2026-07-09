@@ -27556,7 +27556,7 @@ static void lockscreenShow() {
 #if defined(HAS_TANMATSU)
   lv_label_set_text(hint, TR("press Volume Down to unlock"));
 #elif defined(HAS_THINKNODE_M9)
-  lv_label_set_text(hint, TR("hole the d-pad to unlock"));
+  lv_label_set_text(hint, TR("hold the d-pad to unlock"));
 #else
   lv_label_set_text(hint, TR("hold the trackball to unlock"));
 #endif
@@ -28455,9 +28455,6 @@ static bool m9HandleNavKey(int key) {
         navGoToMainTab(HOME_TAB_INDEX);
       }
       s_nav_show = true; if (g_lv.task) g_lv.task->noteUserInput(); return true;
-      if (getActiveTab() == HOME_TAB_INDEX) setHomeDrawer(!s_home_drawer_mode);
-      else                                  navGoToMainTab(HOME_TAB_INDEX);
-      if (g_lv.task) g_lv.task->noteUserInput(); return true;
     case M9_KEY_LEFT_MESSAGE:
       if (s_setup_root) return true;
       navGoToMainTab(CHAT_INBOX_TAB_INDEX);
@@ -29619,6 +29616,7 @@ static void openControlCenter() {
   lv_obj_remove_style_all(card);
 #if defined(HAS_TANMATSU)
   lv_obj_set_size(card, card_w, 384);   // bigger: header + 3 roomier sliders + toggle grid + sysinfo
+#elif defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9)
   lv_obj_set_size(card, card_w, 200);   // sysinfo + thin brightness slider + 2-row toggle grid (fits 240−22 screen)
 #else
   // Portrait has headroom on the 320-tall screen; make the card taller so the
