@@ -27396,7 +27396,20 @@ static void updatePagerEncoder(unsigned long now) {
   // release right after this doesn't ALSO fire updatePagerAltTapNext()'s NEXT.
   if (pagerKeyboardAltHeld() && delta != 0) pagerKeyboardMarkAltUsed();
 
-  if (pagerKeyboardAltHeld() && navOnMainPage()) {
+  if (navOpenDropdown()) {
+    // An open dropdown captures the encoder: lv_dropdown's own key handling only
+    // understands LV_KEY_UP/DOWN to move the highlighted row (+ENTER to confirm,
+    // already wired below via the short-click path) — it ignores LV_KEY_NEXT/PREV,
+    // which is what a plain turn sends in the else branch below. Without this
+    // capture, turning the encoder while a dropdown list is open fell through to
+    // NEXT/PREV, which the focus group instead consumes to move focus OFF the
+    // dropdown — so the highlight never moved and the list was stuck showing
+    // whatever was already selected (reported: opens fine, but turning doesn't
+    // scroll to a choice). Mirrors Tanmatsu's identical navOpenDropdown() capture
+    // in navPump() — see that comment for the lv_dropdown behavior this relies on.
+    for (; delta > 0; delta--) navPushTap(LV_KEY_DOWN);
+    for (; delta < 0; delta++) navPushTap(LV_KEY_UP);
+  } else if (pagerKeyboardAltHeld() && navOnMainPage()) {
     // Alt (the bottom-left orange key, otherwise a hold-only modifier for the
     // keyboard's symbol layer — free to reuse here since it types nothing on
     // its own) + turn jumps directly between the 5 main tabs (Chats/Contacts/
