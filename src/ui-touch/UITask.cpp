@@ -2519,7 +2519,15 @@ static void navMoveDir(int dir) {
   const int n = s_nav_count < kNavMax ? s_nav_count : kNavMax;
   if (n <= 0) return;
   lv_obj_t* cur = lv_group_get_focused(s_nav_group);
-  if (!cur || !lv_obj_is_valid(cur)) { s_nav_show = true; lv_group_focus_obj(s_nav_objs[0]); return; }
+  if (!cur || !lv_obj_is_valid(cur)) {
+    // s_nav_objs is a raw mirror that only refreshes on the next navMaybeRebuild
+    // tick; with chat bubbles now recycled on every scroll-end reflow, slot 0 can
+    // be a just-deleted bubble for one tick — focusing it unguarded dereferences
+    // freed memory inside lv_group_focus_obj.
+    s_nav_show = true;
+    if (s_nav_objs[0] && lv_obj_is_valid(s_nav_objs[0])) lv_group_focus_obj(s_nav_objs[0]);
+    return;
+  }
   // A focused slider captures LEFT/RIGHT to adjust its VALUE instead of moving focus —
   // so horizontal tunes the slider and you leave it by going UP/DOWN. (Same idea as the
   // open-dropdown capture in navPump.) Fire VALUE_CHANGED (live preview) then RELEASED
@@ -25811,6 +25819,12 @@ struct ChatVirtLayout {
   int*         msg_idx       = nullptr;
   int32_t*     offsets       = nullptr;   // virt Y per message; offsets[n] = virt total height
   int32_t*     day_sep_y     = nullptr;   // virt Y of day label before message i, or -1
+  // Ring slots of the first/last laid-out message. Content-generation guard: the
+  // ring evicting or rotating (n unchanged at capacity) and thread switches both
+  // move these, so refreshChatDetail can tell "same count, different content"
+  // apart from "nothing changed" (two threads can never share a ring slot).
+  int          first_ring    = -1;
+  int          last_ring     = -1;
   int32_t      virt_total_h  = 0;
   lv_coord_t   lv_total_h    = 0;
   lv_obj_t*    spacer        = nullptr;
@@ -25830,8 +25844,6 @@ static int*           s_chat_msg_idx     = nullptr;
 static int            s_chat_msg_idx_cap = 0;
 static lv_timer_t*    s_chat_virt_render_timer = nullptr;
 static LvChatPanel*   s_chat_virt_render_panel = nullptr;
-
-static void chatVirtClearAllChildren(LvChatPanel* p);
 
 // Layout offsets are int32; LVGL scroll coords are int16 (~8191 max). When virt
 // height exceeds the cap, scroll Y is compressed for the spacer/scrollbar but bubble
@@ -26049,15 +26061,20 @@ static void chatVirtFreeOffsets() {
 static void chatVirtReset(LvChatPanel* p) {
   chatVirtCancelRenderTimer();
   (void)p;
-  if (s_chat_virt.divider) {
-    lv_obj_del_async(s_chat_virt.divider);
-    s_chat_virt.divider = nullptr;
-  }
+  // Null the divider pointer WITHOUT queueing a delete. It is always a child of
+  // p->msgs, and every path that follows a reset (lv_obj_clean in the empty-thread
+  // branches, chatVirtPurgeMsgsChildrenSync, chatVirtClearBubbleWidgets) deletes
+  // the widget itself. Queueing lv_obj_del_async here handed LVGL a raw pointer
+  // that those synchronous cleans freed FIRST, so the deferred lv_obj_del then ran
+  // on freed memory (and with both panels open, on the OTHER panel's divider).
+  s_chat_virt.divider = nullptr;
   s_chat_virt.spacer = nullptr;
   s_chat_virt.panel  = nullptr;
   s_chat_virt.n      = 0;
   s_chat_virt.divider_i = -1;
   s_chat_virt.divider_y = -1;
+  s_chat_virt.first_ring = -1;
+  s_chat_virt.last_ring  = -1;
   s_chat_virt.compact_chat = false;
   s_chat_virt.compact_thread_name[0] = '\0';
   s_chat_virt.virt_total_h = 0;
@@ -26381,15 +26398,12 @@ static void chatVirtBeforeMassDelete() {
   if (act) lv_indev_wait_release(act);
 }
 
-static void chatVirtDeleteMsgsChild(lv_obj_t* ch) {
-  if (!ch) return;
-  lv_obj_del_async(ch);
-}
-
 // Remove bubble/divider widgets only; keep the spacer so scroll height stays valid.
-// sync_delete: true from lv_async_call render paths — lv_obj_del_async leaves
-// stale children in spec_attr until the next tick, then layout_update_core UAFs.
-static void chatVirtClearBubbleWidgets(LvChatPanel* p, bool sync_delete = false) {
+// Deletes are SYNCHRONOUS: the only caller is chatVirtRenderWindow, which runs in
+// lv_async_call context (after the display refresh) — lv_obj_del_async here would
+// leave stale children in spec_attr until the next tick, and layout_update_core
+// then walks freed memory. Never call this from an indev/event handler.
+static void chatVirtClearBubbleWidgets(LvChatPanel* p) {
   if (!p || !p->msgs) return;
   if (!chatVirtIndevStillScrolling(p)) chatVirtResetInputForMsgs(p);
   chatVirtBeforeMassDelete();
@@ -26399,21 +26413,8 @@ static void chatVirtClearBubbleWidgets(LvChatPanel* p, bool sync_delete = false)
     if (!ch) continue;
     if (s_chat_virt.spacer && ch == s_chat_virt.spacer && lv_obj_is_valid(s_chat_virt.spacer))
       continue;
-    if (sync_delete) lv_obj_del(ch);
-    else             chatVirtDeleteMsgsChild(ch);
+    lv_obj_del(ch);
   }
-}
-
-static void chatVirtClearAllChildren(LvChatPanel* p) {
-  if (!p || !p->msgs) return;
-  chatVirtResetInputForMsgs(p);
-  chatVirtBeforeMassDelete();
-  for (int i = static_cast<int>(lv_obj_get_child_cnt(p->msgs)) - 1; i >= 0; --i) {
-    lv_obj_t* ch = lv_obj_get_child(p->msgs, i);
-    if (ch) chatVirtDeleteMsgsChild(ch);
-  }
-  s_chat_virt.spacer  = nullptr;
-  s_chat_virt.divider = nullptr;
 }
 
 // Sync purge — only call from lv_async_call / timer context, not indev handlers.
@@ -26511,8 +26512,78 @@ static void chatVirtSyncBubblePositions(LvChatPanel* p) {
   }
 }
 
+// Fast path for the by-far most common relayout trigger: new messages appended to
+// the SAME thread with no divider in play. Extends offsets[]/day_sep_y[] for the
+// new tail only instead of re-measuring the whole thread — the full measure is
+// 2-3 lv_txt_get_size calls per message, which on the 5000-message SD ring costs
+// north of 100 ms of UI-thread stall PER RECEIVED MESSAGE with the chat open.
+// Endpoint ring slots prove "pure append": if the first n_old entries were evicted
+// or rotated, first_ring/last_ring moved and we fall back to the full rebuild.
+static bool chatVirtTryAppendLayout(LvChatPanel* p, int n, int divider_i) {
+  const int n_old = s_chat_virt.n;
+  if (s_chat_virt.panel != p || !s_chat_virt.offsets || !s_chat_virt.day_sep_y) return false;
+  if (n_old <= 0 || n <= n_old) return false;
+  if (divider_i >= 0 || s_chat_virt.divider_i >= 0) return false;   // divider math: full rebuild
+  if (s_chat_virt.compact_chat != touchPrefsGetCompactChat()) return false;
+  if (s_chat_msg_idx[0] != s_chat_virt.first_ring ||
+      s_chat_msg_idx[n_old - 1] != s_chat_virt.last_ring) return false;
+
+  int32_t* offs = (int32_t*)heap_caps_malloc(sizeof(int32_t) * (size_t)(n + 1), MALLOC_CAP_SPIRAM);
+  if (!offs) offs = (int32_t*)malloc(sizeof(int32_t) * (size_t)(n + 1));
+  int32_t* seps = (int32_t*)heap_caps_malloc(sizeof(int32_t) * (size_t)n, MALLOC_CAP_SPIRAM);
+  if (!seps) seps = (int32_t*)malloc(sizeof(int32_t) * (size_t)n);
+  if (!offs || !seps) { if (offs) free(offs); if (seps) free(seps); return false; }
+  memcpy(offs, s_chat_virt.offsets,   sizeof(int32_t) * (size_t)(n_old + 1));
+  memcpy(seps, s_chat_virt.day_sep_y, sizeof(int32_t) * (size_t)n_old);
+
+  // Day-key continuity: the appended range needs the day of the last old message.
+  long last_day_key = -1;
+  {
+    UITask::UIMessage m;
+    long dk = 0;
+    if (g_lv.task->getMessageByIndex(s_chat_msg_idx[n_old - 1], m) && chatMsgDayKey(m, &dk))
+      last_day_key = dk;
+  }
+
+  const lv_coord_t row_gap = s_chat_virt.compact_chat ? kChatCompactRowGap : kChatRowGap;
+  const lv_coord_t day_sep_h = chatMeasureDaySepHeight();
+  int32_t y = offs[n_old];                       // continue exactly where the old layout ended
+  for (int i = n_old; i < n; ++i) {
+    seps[i] = -1;
+    UITask::UIMessage m;
+    if (!g_lv.task->getMessageByIndex(s_chat_msg_idx[i], m)) {
+      offs[i] = y;
+      y += 20 + row_gap;
+      continue;
+    }
+    long dk = 0;
+    if (chatMsgDayKey(m, &dk) && dk != last_day_key) {
+      last_day_key = dk;
+      seps[i] = y;
+      y += day_sep_h;
+    }
+    offs[i] = y;
+    y += chatMeasureMessageRowHeight(m, p, i) + row_gap;
+  }
+  offs[n] = y;
+
+  int32_t* old_offs = s_chat_virt.offsets;
+  int32_t* old_seps = s_chat_virt.day_sep_y;
+  s_chat_virt.offsets   = offs;
+  s_chat_virt.day_sep_y = seps;
+  free(old_offs);
+  free(old_seps);
+  s_chat_virt.n          = n;
+  s_chat_virt.msg_idx    = s_chat_msg_idx;
+  s_chat_virt.first_ring = s_chat_msg_idx[0];
+  s_chat_virt.last_ring  = s_chat_msg_idx[n - 1];
+  chatVirtUpdateLvScale(p, n, y);                // total grew: recompute the compression
+  return true;
+}
+
 static bool chatVirtRebuildLayout(LvChatPanel* p, int n, int divider_i) {
   if (!p || !g_lv.task || n <= 0 || !s_chat_msg_idx) return false;
+  if (chatVirtTryAppendLayout(p, n, divider_i)) return true;
   chatVirtFreeOffsets();
   s_chat_virt.offsets = (int32_t*)heap_caps_malloc(sizeof(int32_t) * (size_t)(n + 1),
                                                     MALLOC_CAP_SPIRAM);
@@ -26533,6 +26604,8 @@ static bool chatVirtRebuildLayout(LvChatPanel* p, int n, int divider_i) {
   s_chat_virt.divider_i     = divider_i;
   s_chat_virt.divider_y     = -1;
   s_chat_virt.msg_idx       = s_chat_msg_idx;
+  s_chat_virt.first_ring    = s_chat_msg_idx[0];
+  s_chat_virt.last_ring     = s_chat_msg_idx[n - 1];
   s_chat_virt.content_w     = chatScreenW() - 12;
   s_chat_virt.bubble_max_w  = (s_chat_virt.content_w * 80) / 100;
   s_chat_virt.thread_is_room = false;
@@ -26698,6 +26771,11 @@ static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_i
   lv_obj_add_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(bubble, bubbleLongPressMenuCb, LV_EVENT_LONG_PRESSED,
                       reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
+  // Failed sends keep the pre-virtualization one-tap resend (the compact path
+  // already has it); the footer below spells the affordance out.
+  if (m.outgoing && m.deliv_state == UITask::DELIV_FAILED)
+    lv_obj_add_event_cb(bubble, bubbleRetryTapCb, LV_EVENT_CLICKED,
+                        reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
 
   char ts_buf[20];
   formatBubbleTs(m.ts, ts_buf, sizeof(ts_buf));
@@ -26707,7 +26785,7 @@ static lv_coord_t chatVirtCreateBubble(LvChatPanel* p, int logical_i, int ring_i
     switch (m.deliv_state) {
       case UITask::DELIV_SENT:      deliv_glyph = " " LV_SYMBOL_OK; deliv_fg = COLOR_SUB; break;
       case UITask::DELIV_DELIVERED: deliv_glyph = " " LV_SYMBOL_OK LV_SYMBOL_OK; deliv_fg = COLOR_ACCENT; break;
-      case UITask::DELIV_FAILED:    deliv_glyph = " " LV_SYMBOL_CLOSE; deliv_fg = 0xE08080; break;
+      case UITask::DELIV_FAILED:    deliv_glyph = " " LV_SYMBOL_CLOSE " tap to resend"; deliv_fg = 0xE08080; break;
       default: break;
     }
   }
@@ -26782,13 +26860,11 @@ static lv_coord_t chatVirtCreateCompactRow(LvChatPanel* p, int logical_i, int ri
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
   }
   lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(row, bubbleLongPressMenuCb, LV_EVENT_PRESSED,
-                      reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
-  lv_obj_add_event_cb(row, bubbleLongPressMenuCb, LV_EVENT_RELEASED,
-                      reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
-  lv_obj_add_event_cb(row, bubbleLongPressMenuCb, LV_EVENT_PRESS_LOST,
-                      reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
-  lv_obj_add_event_cb(row, bubbleLongPressMenuCb, LV_EVENT_DELETE,
+  // The menu callback acts ONLY on LV_EVENT_LONG_PRESSED (its first line filters
+  // everything else) — registering it for PRESSED/RELEASED/PRESS_LOST/DELETE left
+  // the compact-row menu completely dead. Register the one event it handles,
+  // exactly like the bubble path.
+  lv_obj_add_event_cb(row, bubbleLongPressMenuCb, LV_EVENT_LONG_PRESSED,
                       reinterpret_cast<void*>(static_cast<intptr_t>(ring_idx)));
   if (m.outgoing && m.deliv_state == UITask::DELIV_FAILED)
     lv_obj_add_event_cb(row, bubbleRetryTapCb, LV_EVENT_CLICKED,
@@ -26894,7 +26970,7 @@ static void chatVirtRenderWindow(LvChatPanel* p, lv_coord_t scroll_y, lv_coord_t
 #endif
 
   const lv_coord_t saved_scroll_y = scroll_y;
-  chatVirtClearBubbleWidgets(p, true);
+  chatVirtClearBubbleWidgets(p);
   chatVirtEnsureSpacer(p, s_chat_virt.lv_total_h);
 
   if (s_chat_virt.divider_i >= 0 && s_chat_virt.divider_y >= 0 &&
@@ -26967,7 +27043,12 @@ static void chatVirtRenderTimerCb(lv_timer_t* t) {
   if (s_chat_virt_render_async_busy) return;
   s_chat_virt_render_async_panel = p;
   s_chat_virt_render_async_busy  = true;
-  lv_async_call(chatVirtRenderAsyncCb, nullptr);
+  if (lv_async_call(chatVirtRenderAsyncCb, nullptr) != LV_RES_OK) {
+    // OOM: the call never queued, so nothing will ever clear the busy flag —
+    // without this the chat would stop re-rendering until reboot.
+    s_chat_virt_render_async_busy  = false;
+    s_chat_virt_render_async_panel = nullptr;
+  }
 }
 
 static void chatVirtScheduleRender(LvChatPanel* p) {
@@ -27107,8 +27188,18 @@ static void refreshChatDetail(LvChatPanel& p) {
   }
 
   const bool compact_chat = touchPrefsGetCompactChat();
+  // Content-generation guard: at ring capacity a new message evicts the oldest,
+  // so n stays CONSTANT while every logical index shifts one slot — and a thread
+  // switch on an already-open panel can land on an equal count too. Comparing the
+  // endpoint ring slots catches both (the ring never reorders interior slots
+  // while the endpoints hold, and two threads cannot share a slot). Without this
+  // the old offsets kept describing the previous content and every row rendered
+  // the next message's text at the previous message's position.
+  const bool ring_changed = (s_chat_virt.n > 0) &&
+                            (s_chat_msg_idx[0] != s_chat_virt.first_ring ||
+                             s_chat_msg_idx[n - 1] != s_chat_virt.last_ring);
   const bool need_layout = (s_chat_virt.panel != &p) || (s_chat_virt.n != n) ||
-                           !s_chat_virt.offsets ||
+                           !s_chat_virt.offsets || ring_changed ||
                            s_chat_virt.compact_chat != compact_chat;
   const bool divider_rebuild = !need_layout && divider_i >= 0 && s_chat_virt.divider_y < 0;
   if (opening || need_layout || divider_rebuild)
@@ -27133,15 +27224,11 @@ static void refreshChatDetail(LvChatPanel& p) {
         chatDetailShowPlaceholder(p, "Low memory");
         return;
       }
-    } else if (g_lv.dirty_timeline) {
-      lv_indev_reset(nullptr, nullptr);
-      s_chat_virt.last_i0 = -1;
-      s_chat_virt.last_i1 = -1;
-      if (!chatVirtRebuildLayout(&p, n, divider_i)) {
-        chatDetailShowPlaceholder(p, "Low memory");
-        return;
-      }
     }
+    // (An `else if (g_lv.dirty_timeline)` rescue used to sit here — it was dead:
+    // UITask::loop clears the flag right after SCHEDULING the async refresh, so
+    // by the time this code ran it always read false. The ring_changed term in
+    // need_layout above covers the cases it was meant to catch.)
   }
 
   lv_coord_t scroll_target = prev_scroll_y;
