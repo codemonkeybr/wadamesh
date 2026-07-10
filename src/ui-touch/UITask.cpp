@@ -72,6 +72,11 @@
     #define PIN_I2S_DOUT 6
   #endif
 #elif defined(TLORA_PAGER)
+  #include <SD.h>             // microSD (CS=21) on the shared radio/display SPI bus --
+                               // file manager browse + WAV picker only; no format support
+                               // this pass (see fmSdTryMount()'s comment)
+  #define PIN_SD_CS PAGER_PIN_SD_CS   // from TLoraPagerBoard.h, already visible via
+                                      // MyMesh.h -> target.h -> TLoraPagerBoard.h above
   #include <driver/i2s.h>     // pager ES8311 codec (notification tones + WAV playback)
   #include "Es8311Codec.h"    // PIN_I2S_MCLK/BCK/WS/DOUT/SDIN come from platformio.ini build flags
 #elif defined(HAS_TANMATSU)
@@ -512,12 +517,14 @@ static constexpr i2s_port_t kI2sPort = I2S_NUM_0;
 // already tight enough that tile downloads can OOM-reboot on their own.
 extern volatile uint16_t s_tile_fetch_pending;
 
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER)
+static bool fmSdTryMount();   // defined far below (microSD mount)
+#endif
 #if defined(HAS_TDECK_GT911)
 // I2S is installed ON DEMAND for the duration of a tone and uninstalled after.
 // Holding the driver resident permanently kept ~2 KB of internal DMA RAM, which
 // shrank the margin the tile-fetch worker relies on and made tile downloads
 // OOM-reboot. Transient install keeps steady-state internal RAM untouched.
-static bool fmSdTryMount();   // defined far below (microSD mount, T-Deck)
 static bool tdeckAudioInstallRate(int rate) {
   // Heap pre-flight. i2s_driver_install ESP_ERROR_CHECKs its internal DMA + timer
   // allocations and abort()s the firmware on NO_MEM — this is the "esp_timer_create
@@ -15627,7 +15634,7 @@ static char      s_fm_path[160]  = {0};     // current dir within s_fm_fs (e.g. 
 // a generic fs::FS*; only &SD is real microSD I/O (Internal = SPIFFS). Browsing
 // (fmRefresh) and the file open/save paths call this; mutations re-list via
 // fmRefresh, so they blip the LED too.
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER)
 static inline bool fmIsSd(fs::FS* fs) { return fs == &SD; }
 #elif defined(HAS_TANMATSU)
 static inline bool fmIsSd(fs::FS* fs) { return fs == &SD_MMC; }   // microSD on SDMMC slot 0
@@ -16366,13 +16373,33 @@ static void fmFmtSize64(uint64_t bytes, char* out, size_t outsz) {
   else                                     snprintf(out, outsz, "%.1f GB", bytes / (1024.0 * 1024 * 1024));
 }
 
-#if defined(HAS_TDECK_GT911)   // microSD mount/format helpers — Arduino SD on the shared LoRa SPI (T-Deck only)
-// Mount the microSD on the shared LoRa SPI bus. Safe to call repeatedly (no-op
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER)   // microSD mount/format helpers — Arduino SD on the shared radio SPI bus
+// One shared-SPI accessor per board: the T-Deck exposes its pre-begun SPIClass via
+// tdeckSharedSPI(); the pager's radio+display already share TFT_eSPI's own instance
+// directly (variants/lilygo_tlora_pager/target.cpp), so reuse that the same way.
+#if defined(TLORA_PAGER)
+static inline SPIClass* sdSharedSPI() { return &TFT_eSPI::getSPIinstance(); }
+// Card-detect via the XL9555 expander (PAGER_EXPAND_SD_DET). Polarity is INVERTED
+// from what you'd guess — confirmed against LilyGoLib's own LilyGo_LoRa_Pager.cpp
+// installSD() (`if (io.digitalRead(EXPANDS_SD_DET)) return false;`): HIGH = no card
+// seated, LOW = card present. Skip the whole mount ladder when no card is seated,
+// so opening the File Manager / WAV picker on a bare pager doesn't grind through
+// the ladder's worst-case delay on every call.
+static inline bool pagerSdCardPresent() {
+  return board.io_expander.digitalRead(PAGER_EXPAND_SD_DET) == LOW;
+}
+#else
+static inline SPIClass* sdSharedSPI() { return tdeckSharedSPI(); }
+#endif
+// Mount the microSD on the shared radio SPI bus. Safe to call repeatedly (no-op
 // once mounted). SD.begin's internal spi.begin() is a no-op because the bus is
 // already initialised by the radio, so the radio's pins are untouched.
 static bool fmSdTryMount() {
   if (s_sd_mounted) return true;
-  SPIClass* spi = tdeckSharedSPI();
+#if defined(TLORA_PAGER)
+  if (!pagerSdCardPresent()) return false;
+#endif
+  SPIClass* spi = sdSharedSPI();
   if (!spi) return false;
   // Cold microSD cards — especially the first mount after boot — often fail
   // the initial SD.begin and historically only recovered after a physical
@@ -16433,7 +16460,7 @@ static void fmSdClickCb(lv_event_t* e) {
   if (s_sd_mounted) fmOpenStorage(&SD, "SD", "/");
 }
 
-#endif  // HAS_TDECK_GT911 (microSD mount helpers; the busy overlays below are generic LVGL)
+#endif  // HAS_TDECK_GT911 || TLORA_PAGER (microSD mount helpers; the busy overlays below are generic LVGL)
 
 // Full-screen "busy" notice (copy/move/format). Pure LVGL — used by the generic paste path too.
 static void fmShowBusyOverlay(const char* msg) {
@@ -17692,6 +17719,18 @@ static void fmShowRoots() {
     lv_obj_t* sd = lv_list_add_btn(s_fm_list, LV_SYMBOL_SD_CARD, "SD card   (tap to mount/format)");
     fmStyleRow(sd, COLOR_SUB);
     lv_obj_add_event_cb(sd, fmSdMountOrFormatCb, LV_EVENT_CLICKED, nullptr);
+  }
+#elif defined(TLORA_PAGER)   // microSD row — browse only this pass, no format (see fmSdTryMount())
+  // The card-detect line makes "not present" unambiguous, unlike the T-Deck (no detect
+  // pin at all) -- so unlike its always-shown "tap to mount/format" fallback row, a bare
+  // pager just shows no SD row at all rather than a row that can never succeed.
+  if (pagerSdCardPresent() && (s_sd_mounted || millis() >= s_sd_retry_after_ms) && fmSdTryMount()) {
+    char sdl[48], cs[16];
+    fmFmtSize64(s_sd_size, cs, sizeof cs);
+    snprintf(sdl, sizeof sdl, TR("SD card   %s"), cs);
+    lv_obj_t* sd = lv_list_add_btn(s_fm_list, LV_SYMBOL_SD_CARD, sdl);
+    fmStyleRow(sd, COLOR_TEXT);
+    lv_obj_add_event_cb(sd, fmSdClickCb, LV_EVENT_SHORT_CLICKED, nullptr);
   }
 #endif
 #if defined(HAS_TANMATSU)
@@ -30320,7 +30359,7 @@ static void appTileCb(lv_event_t* e) {
 #if defined(HAS_TOUCH_UI)
     case APPACT_TERMINAL:  homeTerminalCb(e);    return;
 #endif
-#if CAP_FILESYSTEM
+#if CAP_FILESYSTEM || defined(TLORA_PAGER)
     case APPACT_FILES:     homeFilesCb(e);       return;
 #endif
     default: break;
@@ -30620,7 +30659,7 @@ static void openAppDrawer() {
 #if defined(HAS_TOUCH_UI)
     { ">_",                "Terminal",  APPACT_TERMINAL, 0,         0x3DD27A },      // console green
 #endif
-#if CAP_FILESYSTEM
+#if CAP_FILESYSTEM || defined(TLORA_PAGER)
     { LV_SYMBOL_DIRECTORY, "Files",     APPACT_FILES,    0,         0xE6BE4A },      // folder gold
 #endif
     { nullptr,             "Snake",     APPACT_SNAKE,    0,         0x53C06B },      // snake game (icon drawn from APPACT_SNAKE, not a glyph)
@@ -38099,7 +38138,7 @@ void UITask::loop() {
     if (g_lv.ch.detail_open) refreshChatDetail(g_lv.ch);
     g_lv.dirty_timeline = false;
   }
-#if CAP_SD
+#if CAP_SD || defined(TLORA_PAGER)
   // microSD insert/remove detection — only while the file manager is open, so
   // there's no idle SPI traffic. SD.begin runs on this loop task (never
   // concurrent with the radio's SPI), and reuses the radio's already-begun bus.
