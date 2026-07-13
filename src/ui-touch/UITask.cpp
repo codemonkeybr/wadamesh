@@ -5066,6 +5066,19 @@ static void accentAltCb(lv_event_t* e) {
 // keystroke / a pick / hiding the keyboard.
 static lv_obj_t* s_accbox    = nullptr;
 static lv_obj_t* s_accbox_ta = nullptr;   // the field the box edits
+#if defined(TLORA_PAGER)
+// No touch on this board, and the cells below are NAV_SKIP_FLAG (excluded from
+// the normal keyboard/encoder focus group by design, since touch boards pick
+// them by tap) -- without this, the box is completely unreachable here. Fn
+// (Alt)+Space jumps in (handleHwKey()); the rotary encoder then walks
+// s_accbox_cells (updatePagerEncoder()); Enter (the encoder's own click)
+// confirms via accentNavConfirm(); Backspace cancels.
+static constexpr int kAccentNavMax = 8;   // covers kAccentSets' largest set (7, 'a'/'A')
+static lv_obj_t* s_accbox_cells[kAccentNavMax];
+static uint8_t   s_accbox_cell_n    = 0;
+static bool      s_accentnav_active = false;
+static int       s_accentnav_idx    = 0;
+#endif
 static const AccentSet* accentSetFor(char c) {
   for (const auto& s : kAccentSets) if (s.key == c) return &s;
   return nullptr;
@@ -5073,7 +5086,30 @@ static const AccentSet* accentSetFor(char c) {
 static void accentBoxHide() {
   if (s_accbox) { lv_obj_del(s_accbox); s_accbox = nullptr; }
   s_accbox_ta = nullptr;
+#if defined(TLORA_PAGER)
+  s_accentnav_active = false;
+  s_accbox_cell_n = 0;
+#endif
 }
+#if defined(TLORA_PAGER)
+static void accentNavRestyle() {
+  for (uint8_t i = 0; i < s_accbox_cell_n; ++i) {
+    if (!s_accbox_cells[i]) continue;
+    lv_obj_set_style_bg_color(s_accbox_cells[i],
+      lv_color_hex((int)i == s_accentnav_idx ? COLOR_ACCENT : 0x1B2B3A), LV_PART_MAIN);
+  }
+}
+// Encoder's short-click while picking: fire the highlighted cell's own CLICKED
+// binding (accentBoxCellCb, below) rather than duplicating its delete-base-
+// letter + insert-variant + accentBoxHide() logic.
+static void accentNavConfirm() {
+  if (s_accentnav_idx >= 0 && (uint8_t)s_accentnav_idx < s_accbox_cell_n && s_accbox_cells[s_accentnav_idx]) {
+    lv_event_send(s_accbox_cells[s_accentnav_idx], LV_EVENT_CLICKED, nullptr);
+  } else {
+    accentBoxHide();
+  }
+}
+#endif
 static void accentBoxCellCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   const char* variant = static_cast<const char*>(lv_event_get_user_data(e));
@@ -5096,6 +5132,11 @@ static void accentBoxMaybeShow() {
   const AccentSet* set = accentSetFor(last[0]);
   if (!set) return;
   s_accbox_ta = ta;
+#if defined(TLORA_PAGER)
+  s_accentnav_active = false;   // fresh box -> Fn+Space (re-)arms nav mode
+  s_accentnav_idx = 0;
+  s_accbox_cell_n = set->n < kAccentNavMax ? set->n : (uint8_t)kAccentNavMax;
+#endif
   const int cw = 34, ch = 40, gap = 4, pad = 6;
   s_accbox = lv_obj_create(lv_layer_top());
   lv_obj_add_flag(s_accbox, NAV_SKIP_FLAG);   // passive tap-only hint: never a keyboard-nav focus target (issue #22)
@@ -5118,6 +5159,9 @@ static void accentBoxMaybeShow() {
     lv_obj_set_style_bg_color(c, lv_color_hex(0x1B2B3A), LV_PART_MAIN);
     lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_add_event_cb(c, accentBoxCellCb, LV_EVENT_CLICKED, (void*)set->v[i]);
+#if defined(TLORA_PAGER)
+    if (i < kAccentNavMax) s_accbox_cells[i] = c;
+#endif
     lv_obj_t* l = lv_label_create(c);
     lv_label_set_text(l, set->v[i]);
     lv_obj_set_style_text_font(l, &g_font_16, LV_PART_MAIN);
@@ -27489,7 +27533,17 @@ static void updatePagerEncoder(unsigned long now) {
   // release right after this doesn't ALSO fire updatePagerAltTapNext()'s NEXT.
   if (pagerKeyboardAltHeld() && delta != 0) pagerKeyboardMarkAltUsed();
 
-  if (navOpenDropdown()) {
+  if (s_accentnav_active) {
+    // Accent-variant picker (handleHwKey()'s Fn+Space entry / accentNavConfirm()):
+    // captures the encoder exclusively while active, same priority as an open
+    // dropdown below.
+    const bool turned = (delta != 0);
+    if (s_accbox_cell_n > 0) {
+      for (; delta > 0; delta--) s_accentnav_idx = (s_accentnav_idx + 1) % (int)s_accbox_cell_n;
+      for (; delta < 0; delta++) s_accentnav_idx = (s_accentnav_idx - 1 + (int)s_accbox_cell_n) % (int)s_accbox_cell_n;
+    }
+    if (turned) accentNavRestyle();
+  } else if (navOpenDropdown()) {
     // An open dropdown captures the encoder: lv_dropdown's own key handling only
     // understands LV_KEY_UP/DOWN to move the highlighted row (+ENTER to confirm,
     // already wired below via the short-click path) — it ignores LV_KEY_NEXT/PREV,
@@ -27552,7 +27606,8 @@ static void updatePagerEncoder(unsigned long now) {
     pagerNavGoBack();   // see pagerNavGoBack() above for the ladder + rationale
     s_long_fired = true;
   } else if (!held && s_was_held && !s_long_fired) {
-    navPushTap(LV_KEY_ENTER);   // released before the long-press threshold -> short click
+    if (s_accentnav_active) accentNavConfirm();          // picking an accent: confirm the highlighted one
+    else                    navPushTap(LV_KEY_ENTER);    // released before the long-press threshold -> short click
   }
   s_was_held = held;
 }
@@ -28887,6 +28942,25 @@ static void handleHwKey(int key) {
     return;
   }
   txtMenuHide();   // any keypress while editing dismisses an open edit menu
+#if defined(TLORA_PAGER)
+  // Accent-variant popup (issue #22) is otherwise unreachable here: no touch,
+  // and its cells are NAV_SKIP_FLAG by design (touch boards pick them by tap).
+  // Fn(Alt)+Space jumps keyboard focus into it; the rotary encoder then walks
+  // the highlighted variant (updatePagerEncoder()); Enter (the encoder's own
+  // click) confirms via accentNavConfirm(); Backspace cancels without
+  // deleting the base letter that triggered the popup.
+  if (s_accentnav_active) {
+    if (key == 0x08 || key == 0x7F) { accentBoxHide(); return; }
+    if (key == 0x0D)                { accentNavConfirm(); return; }
+    return;   // swallow everything else while picking (typing, etc.)
+  }
+  if (key == ' ' && pagerKeyboardAltHeld() && s_accbox) {
+    s_accentnav_active = true;
+    s_accentnav_idx = 0;
+    accentNavRestyle();
+    return;
+  }
+#endif
   if (key == 0x08 || key == 0x7F) {            // backspace / delete
     uint32_t bs_s, bs_e;
     if (taHasSelection(ta, &bs_s, &bs_e)) {    // highlighted text -> delete the whole selection
