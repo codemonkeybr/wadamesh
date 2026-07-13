@@ -2409,9 +2409,7 @@ static bool      s_nav_suppress_scroll = false;
 static lv_obj_t* s_nav_focus_hint = nullptr;   // one-shot: focus this object on the next rebuild (#45)
 static void goToTab(int idx);                  // (defined far below) tab switch + refresh
 static int  getActiveTab();                    // (defined below) current tabview index
-#if defined(HAS_TANMATSU)
-static void mapNudge(int dir);                 // (defined far below) Ctrl+Arrow map pan — 0=up 1=down 2=left 3=right
-#endif
+static void mapNudge(int dir);                 // (defined far below) map pan — 0=up 1=down 2=left 3=right
 static bool hwKeyDismissTopPopup();            // (defined far below) close the topmost modal/sheet
 static bool anyPopupOpen();                    // (defined below) is any modal/sheet currently up
 static void closeChatPanel(LvChatPanel* p);    // (defined far below) close an open chat/channel detail
@@ -23371,13 +23369,13 @@ static void mapCanvasEventCb(lv_event_t* e) {
   refreshMapInfoLabel();
 }
 
-#if defined(HAS_TANMATSU)
-// Keyboard pan (Ctrl+Arrow on the Map tab). Mirrors the drag-release math in
-// mapCanvasEventCb: synthesize a pixel delta of ~1/4 the visible span in the
-// arrow direction, convert it through the same world-px ↔ lat/lon helpers (so
-// the lon step automatically scales with the current zoom's degrees-per-pixel)
-// and re-render. dir: 0=up(north,+lat) 1=down(south,−lat) 2=left(west,−lon)
-// 3=right(east,+lon).
+#if defined(HAS_TANMATSU) || defined(TLORA_PAGER)
+// Keyboard pan (Ctrl+Arrow on Tanmatsu / WASD on the pager, both on the Map
+// tab). Mirrors the drag-release math in mapCanvasEventCb: synthesize a pixel
+// delta of ~1/4 the visible span in the arrow direction, convert it through
+// the same world-px ↔ lat/lon helpers (so the lon step automatically scales
+// with the current zoom's degrees-per-pixel) and re-render. dir: 0=up(north,
+// +lat) 1=down(south,−lat) 2=left(west,−lon) 3=right(east,+lon).
 static void mapNudge(int dir) {
   if (!s_map_canvas) return;
   // No center yet (no GPS / location) → nothing to pan around.
@@ -23400,7 +23398,7 @@ static void mapNudge(int dir) {
   renderMapMarkers();
   refreshMapInfoLabel();
 }
-#endif  // HAS_TANMATSU (mapNudge)
+#endif  // HAS_TANMATSU || TLORA_PAGER (mapNudge)
 
 // ----- Zoom + recenter -----
 //
@@ -28844,16 +28842,31 @@ static void handleHwKey(int key) {
     // Slider nudge: this board has no touch/trackball to drag a slider's
     // knob, so a focused lv_slider (Control Center brightness, a Settings
     // slider, the Map zoom bar, …) is otherwise stuck at whatever value it
-    // opened with. D/F reuse navMoveDir()'s existing slider-capture branch
+    // opened with. Q/E reuse navMoveDir()'s existing slider-capture branch
     // (proportional ~20-presses-end-to-end step, live update + persist) —
     // the same adjustment the T-Deck trackball's LEFT/RIGHT already does —
-    // rather than a fixed step that's wrong for every slider's range.
-    if (key == 'd' || key == 'D' || key == 'f' || key == 'F') {
+    // rather than a fixed step that's wrong for every slider's range. (Was
+    // D/F; moved to Q/E to free up WASD for map panning below.)
+    if (key == 'q' || key == 'Q' || key == 'e' || key == 'E') {
       lv_obj_t* focused = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
       if (focused && lv_obj_check_type(focused, &lv_slider_class)) {
-        navMoveDir((key == 'd' || key == 'D') ? NAV_RIGHT : NAV_LEFT);
+        navMoveDir((key == 'e' || key == 'E') ? NAV_RIGHT : NAV_LEFT);
         return;
       }
+    }
+    // Map pan: WASD moves the map around on the Map tab (no touch/trackball
+    // to drag it), reusing the same mapNudge() step/re-render Tanmatsu's
+    // Ctrl+Arrow already uses. W=north A=west S=south D=east.
+    if ((key == 'w' || key == 'W' || key == 'a' || key == 'A' ||
+         key == 's' || key == 'S' || key == 'd' || key == 'D') &&
+        getActiveTab() == MAP_TAB_INDEX) {
+      switch (key) {
+        case 'w': case 'W': mapNudge(0); break;
+        case 's': case 'S': mapNudge(1); break;
+        case 'a': case 'A': mapNudge(2); break;
+        case 'd': case 'D': mapNudge(3); break;
+      }
+      return;
     }
 #endif
 #if CAP_TRACKBALL
