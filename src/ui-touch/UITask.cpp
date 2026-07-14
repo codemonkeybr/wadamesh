@@ -5196,10 +5196,47 @@ static lv_obj_t* s_mentionbox    = nullptr;
 static lv_obj_t* s_mentionbox_ta = nullptr;
 static constexpr int k_mention_max = 6;
 static char s_mention_names[k_mention_max][32];   // kept alive for the cell callbacks
+#if defined(TLORA_PAGER)
+// No touch on this board, and the cells below are NAV_SKIP_FLAG (excluded from
+// the normal keyboard/encoder focus group by design, since touch boards pick
+// them by tap) -- without this, the box is completely unreachable here.
+// Unlike the accent box (armed explicitly via Fn+Space), this list grabs the
+// encoder the INSTANT it's shown (mentionBoxMaybeShow() sets
+// s_mentionnav_active=true directly) -- see that function for why. The rotary
+// encoder walks s_mentionbox_cells (updatePagerEncoder()); Enter (the
+// encoder's own click) confirms via mentionNavConfirm(); Backspace cancels.
+static lv_obj_t* s_mentionbox_cells[k_mention_max];
+static uint8_t   s_mentionbox_cell_n  = 0;
+static bool      s_mentionnav_active  = false;
+static int       s_mentionnav_idx     = 0;
+#endif
 static void mentionBoxHide() {
   if (s_mentionbox) { lv_obj_del(s_mentionbox); s_mentionbox = nullptr; }
   s_mentionbox_ta = nullptr;
+#if defined(TLORA_PAGER)
+  s_mentionnav_active = false;
+  s_mentionbox_cell_n = 0;
+#endif
 }
+#if defined(TLORA_PAGER)
+static void mentionNavRestyle() {
+  for (uint8_t i = 0; i < s_mentionbox_cell_n; ++i) {
+    if (!s_mentionbox_cells[i]) continue;
+    lv_obj_set_style_bg_color(s_mentionbox_cells[i],
+      lv_color_hex((int)i == s_mentionnav_idx ? COLOR_ACCENT : 0x1B2B3A), LV_PART_MAIN);
+  }
+}
+// Encoder's short-click while picking: fire the highlighted cell's own CLICKED
+// binding (mentionBoxCellCb, below) rather than duplicating its delete-partial
+// + insert-name + mentionBoxHide() logic.
+static void mentionNavConfirm() {
+  if (s_mentionnav_idx >= 0 && (uint8_t)s_mentionnav_idx < s_mentionbox_cell_n && s_mentionbox_cells[s_mentionnav_idx]) {
+    lv_event_send(s_mentionbox_cells[s_mentionnav_idx], LV_EVENT_CLICKED, nullptr);
+  } else {
+    mentionBoxHide();
+  }
+}
+#endif
 // Index of the active mention's '@' in `text`, or -1. The active mention is the
 // last '@' that begins a word (start of text or after whitespace) with no
 // whitespace between it and the end (where the caret is).
@@ -5254,6 +5291,16 @@ static bool mentionBoxMaybeShow() {
   }
   if (n == 0) return false;
   s_mentionbox_ta = ta;
+#if defined(TLORA_PAGER)
+  // Unlike the accent box (armed explicitly via Fn+Space, since it pops up
+  // after almost every letter typed and must not steal focus from ongoing
+  // typing), the mention list only appears when the user has deliberately
+  // typed "@partial" looking for someone to pick -- so it grabs the encoder
+  // immediately, no arming gesture needed.
+  s_mentionnav_active = true;
+  s_mentionnav_idx = 0;
+  s_mentionbox_cell_n = (uint8_t)n;
+#endif
   s_mentionbox = lv_obj_create(lv_layer_top());
   lv_obj_add_flag(s_mentionbox, NAV_SKIP_FLAG);   // passive, touch-only — never a keyboard-nav stop (issue #42)
   lv_obj_remove_style_all(s_mentionbox);
@@ -5275,6 +5322,9 @@ static bool mentionBoxMaybeShow() {
     lv_obj_set_style_bg_color(b, lv_color_hex(0x1B2B3A), LV_PART_MAIN);
     lv_obj_set_style_bg_color(b, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_add_event_cb(b, mentionBoxCellCb, LV_EVENT_CLICKED, (void*)s_mention_names[i]);
+#if defined(TLORA_PAGER)
+    if (i < k_mention_max) s_mentionbox_cells[i] = b;
+#endif
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text_fmt(l, "@%s", s_mention_names[i]);
     lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
@@ -5284,6 +5334,9 @@ static bool mentionBoxMaybeShow() {
     lv_obj_center(l);
   }
   lv_obj_set_size(s_mentionbox, boxw + 8, n * rowh + (n - 1) * 3 + 8);
+#if defined(TLORA_PAGER)
+  mentionNavRestyle();   // highlight entry 0 immediately -- see the auto-arm note above
+#endif
   // Place it above the composer, clamped above the keyboard (mirrors the accent box).
   lv_obj_update_layout(s_mentionbox);
   lv_area_t a; lv_obj_get_coords(ta, &a);
@@ -27547,7 +27600,18 @@ static void updatePagerEncoder(unsigned long now) {
   // release right after this doesn't ALSO fire updatePagerAltTapNext()'s NEXT.
   if (pagerKeyboardAltHeld() && delta != 0) pagerKeyboardMarkAltUsed();
 
-  if (s_accentnav_active) {
+  if (s_mentionnav_active) {
+    // @-mention contact picker (handleHwKey()'s Fn+Space entry / mentionNavConfirm()):
+    // captures the encoder exclusively while active, same priority as the accent
+    // picker and an open dropdown below (mention and accent never show at once —
+    // composerSuggestRefresh() -- so there's no ordering conflict between them).
+    const bool turned = (delta != 0);
+    if (s_mentionbox_cell_n > 0) {
+      for (; delta > 0; delta--) s_mentionnav_idx = (s_mentionnav_idx + 1) % (int)s_mentionbox_cell_n;
+      for (; delta < 0; delta++) s_mentionnav_idx = (s_mentionnav_idx - 1 + (int)s_mentionbox_cell_n) % (int)s_mentionbox_cell_n;
+    }
+    if (turned) mentionNavRestyle();
+  } else if (s_accentnav_active) {
     // Accent-variant picker (handleHwKey()'s Fn+Space entry / accentNavConfirm()):
     // captures the encoder exclusively while active, same priority as an open
     // dropdown below.
@@ -27624,7 +27688,8 @@ static void updatePagerEncoder(unsigned long now) {
     // keyboard Enter: on a focused chat bubble that means the per-message
     // action menu (navEnterBubble), not a plain ENTER keypress -- mirrors
     // handleHwKey()'s Enter branch exactly so both inputs agree.
-    if (s_accentnav_active)         accentNavConfirm();  // picking an accent: confirm the highlighted one
+    if (s_mentionnav_active)        mentionNavConfirm(); // picking a mention: confirm the highlighted one
+    else if (s_accentnav_active)    accentNavConfirm();  // picking an accent: confirm the highlighted one
     else if (!navEnterBubble())     navPushTap(LV_KEY_ENTER);
   }
   s_was_held = held;
@@ -28977,12 +29042,23 @@ static void handleHwKey(int key) {
   }
   txtMenuHide();   // any keypress while editing dismisses an open edit menu
 #if defined(TLORA_PAGER)
-  // Accent-variant popup (issue #22) is otherwise unreachable here: no touch,
-  // and its cells are NAV_SKIP_FLAG by design (touch boards pick them by tap).
-  // Fn(Alt)+Space jumps keyboard focus into it; the rotary encoder then walks
-  // the highlighted variant (updatePagerEncoder()); Enter (the encoder's own
-  // click) confirms via accentNavConfirm(); Backspace cancels without
-  // deleting the base letter that triggered the popup.
+  // Accent-variant / @-mention popups (issues #22, #42) are otherwise
+  // unreachable here: no touch, and their cells are NAV_SKIP_FLAG by design
+  // (touch boards pick them by tap). The rotary encoder walks the highlighted
+  // cell (updatePagerEncoder()); Enter (the encoder's own click) confirms;
+  // Backspace cancels without touching the text that triggered it.
+  //
+  // The @-mention list grabs the encoder the INSTANT it appears (set in
+  // mentionBoxMaybeShow()) -- it only shows up after the user has deliberately
+  // typed "@partial" looking for someone, so there's no ongoing-typing to
+  // protect. The accent box is different: it pops up after almost every
+  // vowel/consonant typed, so stealing focus immediately would swallow normal
+  // typing -- it stays passive until explicitly armed with Fn(Alt)+Space.
+  if (s_mentionnav_active) {
+    if (key == 0x08 || key == 0x7F) { mentionBoxHide(); return; }
+    if (key == 0x0D)                { mentionNavConfirm(); return; }
+    return;   // swallow everything else while picking (typing, etc.)
+  }
   if (s_accentnav_active) {
     if (key == 0x08 || key == 0x7F) { accentBoxHide(); return; }
     if (key == 0x0D)                { accentNavConfirm(); return; }
