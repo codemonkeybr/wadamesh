@@ -380,6 +380,11 @@
       <div class="guide-head"><h3>Install with bmorcelli's Launcher</h3></div>
       <p class="p"><a href="https://bmorcelli.github.io/Launcher/" target="_blank" rel="noopener">Launcher</a> is a multi-app boot menu for ESP32 devices — keep it, and run WADAMESH as one of your apps.</p>
       <p class="p" style="margin-top:10px"><b>This path is for the LilyGo&nbsp;T-Deck only.</b> On the Heltec&nbsp;V4, install <a href="#standalone" onclick="choose('standalone');return false">Standalone</a> instead.</p>
+      <div class="chtoggle" role="group" aria-label="Release channel" style="display:inline-flex;margin:14px 0 0;border:1px solid var(--line);border-radius:10px;overflow:hidden">
+        <button type="button" data-wm-ch="stable" style="font:inherit;font-size:.85rem;font-weight:600;padding:7px 16px;border:0;background:#fff;color:var(--mut);cursor:pointer">Stable</button>
+        <button type="button" data-wm-ch="beta" style="font:inherit;font-size:.85rem;font-weight:600;padding:7px 16px;border:0;border-left:1px solid var(--line);background:#fff;color:var(--mut);cursor:pointer">Beta · testing</button>
+      </div>
+      <p style="margin:8px auto 0;max-width:560px;font-size:.84rem;color:var(--mut)"><b>Stable</b> is the tested default; <b>Beta</b> gets new builds earlier. The download below follows this choice.</p>
       <div class="steps" style="margin-top:22px">
         <div class="step"><div class="num">1</div><div><h4>Install Launcher first</h4><p>Flash bmorcelli's Launcher to your device, following its own installer — <a href="https://bmorcelli.github.io/Launcher/" target="_blank" rel="noopener">bmorcelli.github.io/Launcher</a>.</p></div></div>
         <div class="step"><div class="num">2</div><div><h4>Add the WADAMESH app</h4><p>Grab the WADAMESH <b>app image</b> for your board below, then install it from Launcher (via its web UI / OTA, or copy the <code>.bin</code> to your SD card).</p></div></div>
@@ -387,7 +392,8 @@
       </div>
       <div class="boards" style="grid-template-columns:1fr; max-width:380px">
         <div class="board"><h4>LilyGo T-Deck / Plus</h4><p>app image (no bootloader)</p>
-          <a class="dl" id="dl-tdeck" href="https://firmware.wadamesh.com/latest/wadamesh-tdeck.bin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</a></div>
+          <a class="dl" id="dl-tdeck" download href="https://firmware.wadamesh.com/latest/wadamesh-tdeck.bin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</a>
+          <p style="margin:11px 0 0;font-size:.84rem;color:var(--mut);line-height:1.5">You're downloading version <b data-wn-tag style="color:var(--teal)">…</b><span data-wm-chlabel></span>.<br>The file saves as <code data-dl-fname style="font-size:.82em">wadamesh-tdeck.bin</code> — rename it if you keep several.</p></div>
       </div>
       <p class="hint">New to Launcher? It's the easiest way to try WADAMESH without giving up your other firmware — and you can fully switch to Standalone any time.</p>
     </div>
@@ -548,6 +554,7 @@ We use no tracking, analytics, or advertising cookies. Our CDN and security prov
     if (bT) bT.setAttribute('manifest', wmManifest('tdeck'));
     const dl = document.getElementById('dl-tdeck');
     if (dl) dl.href = 'https://firmware.wadamesh.com/' + WM.feed + '/wadamesh-tdeck.bin';
+    document.querySelectorAll('[data-wm-chlabel]').forEach(e => e.textContent = ch === 'beta' ? ' · beta (testing)' : ' · stable');
     document.querySelectorAll('[data-wm-ch]').forEach(b => { const on = b.getAttribute('data-wm-ch') === ch;
       b.style.background = on ? 'var(--teal)' : '#fff'; b.style.color = on ? '#fff' : 'var(--mut)'; });
     document.querySelectorAll('[data-wm-betahint]').forEach(e => e.hidden = ch !== 'beta');
