@@ -149,6 +149,22 @@
     flex-direction:column; gap:10px; align-items:flex-start; box-shadow:0 8px 26px -22px rgba(21,24,30,.5)}
   .board h4{font-size:1.02rem}
   .board p{color:var(--mut); font-size:.86rem}
+  /* Per-board support-level badge + hover popover (same visual language as the hero pills). */
+  .sup{position:relative; display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
+    font-size:.72rem; font-weight:700; letter-spacing:.2px; cursor:default; width:max-content}
+  .sup .dot{width:7px; height:7px; border-radius:50%; flex:none}
+  .sup.full{background:#e7f6ec; color:#1c7c3f; border:1px solid #bfe6cc}
+  .sup.full .dot{background:#27a35a}
+  .sup.part{background:#fdf3e4; color:#9a6410; border:1px solid #f0dcb4}
+  .sup.part .dot{background:#e3a127}
+  .sup .pop{position:absolute; top:calc(100% + 11px); left:0; transform:translateY(5px);
+    width:min(272px,80vw); background:#fff; border:1px solid var(--line); border-radius:12px; padding:13px 15px;
+    box-shadow:0 18px 44px -18px rgba(21,24,30,.32); text-align:left; font-size:.84rem; font-weight:400;
+    letter-spacing:0; line-height:1.5; color:var(--mut); opacity:0; visibility:hidden;
+    transition:opacity .16s ease, transform .16s ease; z-index:20; cursor:default}
+  .sup .pop b{display:block; color:var(--ink); margin-bottom:4px; font-size:.92rem}
+  .sup .pop::before{content:""; position:absolute; bottom:100%; left:18px; border:7px solid transparent; border-bottom-color:#fff}
+  .sup:hover .pop,.sup:focus .pop,.sup:focus-within .pop{opacity:1; visibility:visible; transform:translateY(0)}
   esp-web-install-button{--esp-tools-button-color:var(--teal);--esp-tools-button-text-color:#fff}
   .dl{display:inline-flex;align-items:center;gap:8px;background:var(--teal);color:#fff;border-radius:9px;
     padding:9px 15px;font-weight:650;font-size:.9rem}
@@ -353,26 +369,37 @@
       </div>
       <div class="boards">
         <div class="board"><h4>Heltec V4 + TFT</h4><p>ESP32-S3 with CHSC6x touch.</p>
+          <span class="sup full" tabindex="0"><span class="dot"></span>Fully supported<span class="pop"><b>Fully supported</b>Everything wadamesh offers works here — this is one of the two primary development boards, tested on every release.</span></span>
           <esp-web-install-button id="inst-heltec" manifest="https://firmware.wadamesh.com/latest/manifest-heltec-v4-tft.json"></esp-web-install-button>
           <a class="dl2" data-dl-board="heltec-v4-tft" download href="https://firmware.wadamesh.com/latest/wadamesh-heltec-v4-tft-merged.bin"><span class="dl2-row"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</span><span class="dlver" data-dl-ver></span></a></div>
         <div class="board"><h4>LilyGo T-Deck / Plus</h4><p>ESP32-S3 keyboard handheld.</p>
+          <span class="sup full" tabindex="0"><span class="dot"></span>Fully supported<span class="pop"><b>Fully supported</b>Everything wadamesh offers works here — this is one of the two primary development boards, tested on every release.</span></span>
           <esp-web-install-button id="inst-tdeck" manifest="https://firmware.wadamesh.com/latest/manifest-tdeck.json"></esp-web-install-button>
           <a class="dl2" data-dl-board="tdeck" download href="https://firmware.wadamesh.com/latest/wadamesh-tdeck-merged.bin"><span class="dl2-row"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</span><span class="dlver" data-dl-ver></span></a></div>
         <div class="board"><h4>ThinkNode M9</h4><p>ESP32-S3 QWERTY handheld (LR1110).</p>
+          <span class="sup part" tabindex="0"><span class="dot"></span>Partially supported<span class="pop"><b>Partially supported</b>The core works: LoRa mesh communication, chat, contacts, channels and the phone-app link. Not every feature has been ported or hardware-verified on this board yet.</span></span>
           <esp-web-install-button id="inst-m9" manifest="https://firmware.wadamesh.com/latest-beta/manifest-thinknode-m9.json"></esp-web-install-button>
           <a class="dl2" data-dl-board="thinknode-m9" data-dl-betaonly download href="https://firmware.wadamesh.com/latest-beta/wadamesh-thinknode-m9-merged.bin"><span class="dl2-row"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</span><span class="dlver" data-dl-ver></span></a>
           <p data-wm-betaonly style="color:var(--mut);font-size:.78rem;margin:6px 0 0">New board: beta channel only until the next stable.</p></div>
         <div class="board"><h4>RAK WisMesh Tap V2</h4><p>ESP32-S3 touch node.</p>
+          <span class="sup part" tabindex="0"><span class="dot"></span>Partially supported<span class="pop"><b>Partially supported</b>The core works: LoRa mesh communication, chat, contacts, channels and the phone-app link. Not every feature has been ported or hardware-verified on this board yet.</span></span>
           <esp-web-install-button id="inst-rak" manifest="https://firmware.wadamesh.com/latest-beta/manifest-rak-tap-v2.json"></esp-web-install-button>
           <a class="dl2" data-dl-board="rak-tap-v2" data-dl-betaonly download href="https://firmware.wadamesh.com/latest-beta/wadamesh-rak-tap-v2-merged.bin"><span class="dl2-row"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</span><span class="dlver" data-dl-ver></span></a>
           <p data-wm-betaonly style="color:var(--mut);font-size:.78rem;margin:6px 0 0">New board: beta channel only until the next stable.</p></div>
         <div class="board"><h4>Heltec V4-R8 <span style="font-weight:600;color:var(--mut)">(experimental)</span></h4><p>ESP32-S3 &middot; 8&nbsp;MB PSRAM &middot; SD card.</p>
+          <span class="sup part" tabindex="0"><span class="dot"></span>Partially supported<span class="pop"><b>Partially supported</b>The core works: LoRa mesh communication, chat, contacts, channels and the phone-app link. This revision is still being hardware-verified — flash with care and report back.</span></span>
           <esp-web-install-button id="inst-v4r8" manifest="https://firmware.wadamesh.com/latest-beta/manifest-heltec-v4-r8-tft.json"></esp-web-install-button>
           <a class="dl2" data-dl-board="heltec-v4-r8-tft" data-dl-betaonly download href="https://firmware.wadamesh.com/latest-beta/wadamesh-heltec-v4-r8-tft-merged.bin"><span class="dl2-row"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</span><span class="dlver" data-dl-ver></span></a>
           <p data-wm-betaonly style="color:var(--mut);font-size:.78rem;margin:6px 0 0">New board, not yet hardware-tested &mdash; beta only. Please flash with care and report back.</p></div>
         <div class="board"><h4>Tanmatsu</h4><p>ESP32-P4 keyboard handheld.</p>
+          <span class="sup part" tabindex="0"><span class="dot"></span>Partially supported<span class="pop"><b>Partially supported</b>The core works: LoRa mesh communication, chat, contacts, channels and the phone-app link over Wi-Fi/USB. Some features are still settling on this board (Bluetooth pairing has known gaps).</span></span>
           <p style="color:var(--mut);font-size:.84rem;margin:0;line-height:1.5">Already have one? No USB flashing needed — install WADAMESH straight from the <b>Tanmatsu app store</b> on the device.</p>
           <a class="dl" href="https://shop.nicolaielectronics.nl/" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>Get a Tanmatsu</a></div>
+        <div class="board"><h4>LilyGo T-Display P4</h4><p>ESP32-P4 AMOLED touch handheld.</p>
+          <span class="sup part" tabindex="0"><span class="dot"></span>Partially supported<span class="pop"><b>Partially supported</b>Early port — it's known that not everything works yet, but the core does: LoRa mesh communication, chat, map, GPS and the phone-app link over Wi-Fi or USB. Bluetooth pairing isn't available on this board (a hardware limitation of its stock radio firmware).</span></span>
+          <esp-web-install-button id="inst-tdp4" manifest="https://firmware.wadamesh.com/latest-beta/manifest-tdisplay-p4.json"></esp-web-install-button>
+          <a class="dl2" data-dl-board="tdisplay-p4" data-dl-betaonly download href="https://firmware.wadamesh.com/latest-beta/wadamesh-tdisplay-p4-merged.bin"><span class="dl2-row"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</span><span class="dlver" data-dl-ver></span></a>
+          <p data-wm-betaonly style="color:var(--mut);font-size:.78rem;margin:6px 0 0">New board: beta channel only until the next stable.</p></div>
       </div>
       <details class="verpick">
         <summary>Install a previous version</summary>
