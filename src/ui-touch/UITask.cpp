@@ -26438,14 +26438,6 @@ static void makeChatDetail(LvChatPanel& p) {
   // transparent button keeps a usable touch target (plus ext_click_area) while
   // only the glyph is visible; UITask::loop dims them to 50% one second after
   // the last scroll (jumpBtnsSetDim above).
-  // "Jump to oldest" (up arrow) skipped on the pager only: no touch to tap it,
-  // and unlike jump_btn (down arrow) it has no keyboard-driven alternative
-  // today, so it's just dead clutter on the right edge of the chat rather than
-  // a feature this board would lose — left null, which every consumer of
-  // jump_oldest_btn already handles safely (all null-guarded). jump_btn stays
-  // exactly as-is (its Backspace-tap alternative, handleHwKey()'s TLORA_PAGER
-  // branch, still relies on it).
-#if !defined(TLORA_PAGER)
   p.jump_oldest_btn = lv_btn_create(p.overlay);
   lv_obj_set_size(p.jump_oldest_btn, 28, 36);
   lv_obj_set_style_bg_opa(p.jump_oldest_btn, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -26470,15 +26462,7 @@ static void makeChatDetail(LvChatPanel& p) {
 #endif
   lv_obj_add_event_cb(p.jump_oldest_btn, jumpToOldestCb, LV_EVENT_CLICKED, &p);
   lv_obj_add_flag(p.jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
-#endif  // !TLORA_PAGER (jump_oldest_btn)
 
-  // "Jump to latest" (down arrow) skipped on the pager too: no touch to tap
-  // it, and its keyboard-driven alternative (a Backspace tap, handleHwKey()'s
-  // TLORA_PAGER branch) doesn't need the button object itself -- it's updated
-  // below to check chatVirtAwayFromBottom() directly instead of reading this
-  // (now pager-absent) button's hidden-state. Left null, same as
-  // jump_oldest_btn above -- every consumer already null-guards it.
-#if !defined(TLORA_PAGER)
   p.jump_btn = lv_btn_create(p.overlay);
   lv_obj_set_size(p.jump_btn, 28, 36);
   lv_obj_set_style_bg_opa(p.jump_btn, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -26504,7 +26488,6 @@ static void makeChatDetail(LvChatPanel& p) {
 #endif
   lv_obj_add_event_cb(p.jump_btn, jumpToLatestCb, LV_EVENT_CLICKED, &p);
   lv_obj_add_flag(p.jump_btn, LV_OBJ_FLAG_HIDDEN);
-#endif  // !TLORA_PAGER (jump_btn)
 
   // ---- Composer row ----
   p.composer_row = lv_obj_create(p.overlay);
@@ -32839,23 +32822,21 @@ if (g_lv.task && g_lv.task->isManualLock()) {
       return;
     }
     // Jump to latest: this board has no touch to tap the floating "scroll to
-    // bottom" circle other boards get (it isn't even created here, see
-    // makeChatDetail()'s TLORA_PAGER carve-out), so a plain Backspace tap
-    // does the same jump the T-Deck's own jumpToLatestCb() does on click
-    // (mirrors the Tanmatsu F6 hardware-key handler above). Checks
-    // chatVirtAwayFromBottom() directly -- the exact predicate the (absent)
-    // button's own visibility would have used -- instead of reading a button
-    // that no longer exists on this board. Only fires while actually away
-    // from the newest message, so a Backspace tap at the bottom of the chat
-    // (or outside a chat) still falls through to its normal no-op / hold-to-
-    // back behavior below. Also moves nav focus to the composer -- without
-    // touch, nav focus was left sitting on whichever message bubble was
-    // focused pre-jump, so typing a reply right after catching up meant
-    // first navigating there manually.
+    // bottom" circle (LvChatPanel::jump_btn) that appears once you've
+    // scrolled up in a chat, so a plain Backspace tap does the same jump +
+    // hide the T-Deck's own jumpToLatestCb() does on click (mirrors the
+    // Tanmatsu F6 hardware-key handler above, plus the hide step that one is
+    // missing). Only intercepted while the button is actually showing, so a
+    // Backspace tap at the bottom of the chat (or outside a chat) still falls
+    // through to its normal no-op / hold-to-back behavior below. Also moves
+    // nav focus to the composer -- without touch, nav focus was left sitting
+    // on whichever message bubble was focused pre-jump, so typing a reply
+    // right after catching up meant first navigating there manually.
     if (key == 0x08) {
       LvChatPanel* cp = navOpenChatPanel();
-      if (cp && cp->msgs && chatVirtAwayFromBottom(cp)) {
-        chatVirtJumpToLatest(cp);
+      if (cp && cp->msgs && cp->jump_btn && !lv_obj_has_flag(cp->jump_btn, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_scroll_to_y(cp->msgs, LV_COORD_MAX, LV_ANIM_ON);
+        lv_obj_add_flag(cp->jump_btn, LV_OBJ_FLAG_HIDDEN);
         if (cp->composer_ta && lv_obj_is_valid(cp->composer_ta)) {
           lv_group_focus_obj(cp->composer_ta);
           s_nav_show = true;
