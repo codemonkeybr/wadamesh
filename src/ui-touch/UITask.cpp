@@ -26690,13 +26690,22 @@ static void chatUpdateJumpButtons(LvChatPanel* p) {
   if (!p || !p->msgs) return;
   s_jump_active_ms = millis();
   if (s_jump_dimmed) jumpBtnsSetDim(p, false);
+  // Always evaluated, even with no jump buttons to toggle (the pager builds
+  // neither): chatVirtAwayFromBottom -> chatVirtMaxScrollY has the LOAD-BEARING
+  // side effect of sizing the virt spacer (chatVirtRefreshScrollArea), and the
+  // opening refreshChatDetail relies on this call to establish the scroll
+  // extent BEFORE the async render applies the queued open-to-divider/bottom
+  // scroll. With the call skipped behind the (pager-null) jump_btn guard, that
+  // scroll_to_y clamped against a ~0-height content area and every chat opened
+  // pinned to the TOP (oldest) instead of the NEW divider / newest message.
+  const bool away = chatVirtAwayFromBottom(p);
   if (p->jump_oldest_btn) {
     if (lv_obj_get_scroll_y(p->msgs) > 30) lv_obj_clear_flag(p->jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(p->jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
   }
   if (p->jump_btn) {
-    if (chatVirtAwayFromBottom(p)) lv_obj_clear_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
-    else                         lv_obj_add_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
+    if (away) lv_obj_clear_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
   }
 }
 #if TRACE_MESSAGE_SCROLL_ACTIVITY
