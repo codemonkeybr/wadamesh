@@ -26690,13 +26690,22 @@ static void chatUpdateJumpButtons(LvChatPanel* p) {
   if (!p || !p->msgs) return;
   s_jump_active_ms = millis();
   if (s_jump_dimmed) jumpBtnsSetDim(p, false);
+  // Always evaluated, even with no jump buttons to toggle (the pager builds
+  // neither): chatVirtAwayFromBottom -> chatVirtMaxScrollY has the LOAD-BEARING
+  // side effect of sizing the virt spacer (chatVirtRefreshScrollArea), and the
+  // opening refreshChatDetail relies on this call to establish the scroll
+  // extent BEFORE the async render applies the queued open-to-divider/bottom
+  // scroll. With the call skipped behind the (pager-null) jump_btn guard, that
+  // scroll_to_y clamped against a ~0-height content area and every chat opened
+  // pinned to the TOP (oldest) instead of the NEW divider / newest message.
+  const bool away = chatVirtAwayFromBottom(p);
   if (p->jump_oldest_btn) {
     if (lv_obj_get_scroll_y(p->msgs) > 30) lv_obj_clear_flag(p->jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(p->jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
   }
   if (p->jump_btn) {
-    if (chatVirtAwayFromBottom(p)) lv_obj_clear_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
-    else                         lv_obj_add_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
+    if (away) lv_obj_clear_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
   }
 }
 #if TRACE_MESSAGE_SCROLL_ACTIVITY
@@ -26863,6 +26872,15 @@ static void makeChatDetail(LvChatPanel& p) {
   // transparent button keeps a usable touch target (plus ext_click_area) while
   // only the glyph is visible; UITask::loop dims them to 50% one second after
   // the last scroll (jumpBtnsSetDim above).
+  // Both floating jump arrows are touch-only affordances with no purpose on
+  // the T-LoRa Pager (no touchscreen), so skip creating them on that board
+  // and leave the pointers null like every consumer already handles safely
+  // (chatUpdateJumpButtons, jumpBtnsSetDim, the LvChatPanel reset — all
+  // null-guarded). The pager's own Backspace-tap "jump to latest" shortcut
+  // below no longer depends on jump_btn's existence; it checks
+  // chatVirtAwayFromBottom() directly and calls chatVirtJumpToLatest(), the
+  // same virtualization-aware jump this button's own click handler uses.
+#if !defined(TLORA_PAGER)
   p.jump_oldest_btn = lv_btn_create(p.overlay);
   lv_obj_set_size(p.jump_oldest_btn, 28, 36);
   lv_obj_set_style_bg_opa(p.jump_oldest_btn, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -26887,7 +26905,9 @@ static void makeChatDetail(LvChatPanel& p) {
 #endif
   lv_obj_add_event_cb(p.jump_oldest_btn, jumpToOldestCb, LV_EVENT_CLICKED, &p);
   lv_obj_add_flag(p.jump_oldest_btn, LV_OBJ_FLAG_HIDDEN);
+#endif  // !TLORA_PAGER (jump_oldest_btn)
 
+#if !defined(TLORA_PAGER)
   p.jump_btn = lv_btn_create(p.overlay);
   lv_obj_set_size(p.jump_btn, 28, 36);
   lv_obj_set_style_bg_opa(p.jump_btn, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -26913,6 +26933,7 @@ static void makeChatDetail(LvChatPanel& p) {
 #endif
   lv_obj_add_event_cb(p.jump_btn, jumpToLatestCb, LV_EVENT_CLICKED, &p);
   lv_obj_add_flag(p.jump_btn, LV_OBJ_FLAG_HIDDEN);
+#endif  // !TLORA_PAGER (jump_btn)
 
   // ---- Composer row ----
   p.composer_row = lv_obj_create(p.overlay);
@@ -28863,9 +28884,30 @@ static void chatVirtFreeOffsets() {
   if (s_chat_virt.day_sep_y) { heap_caps_free(s_chat_virt.day_sep_y); s_chat_virt.day_sep_y = nullptr; }
 }
 
+#if defined(TLORA_PAGER)
+// Encoder-nav focus survival across the virtualized re-render. The render
+// deletes and recreates every bubble row — LVGL hands focus of a deleted
+// object to the next surviving group entry (the chat header/composer once
+// every bubble is gone), which is how focus "fell out" of the message list
+// mid-history on this no-touch board. The pending logical index below is the
+// message the encoder is steering toward: chatVirtRenderWindow re-aims focus
+// at the matching recreated row via the existing one-shot s_nav_focus_hint
+// rebuild mechanism, and pagerEncoderChatEdgeScroll both sets it (edge detent
+// = neighbor index) and folds further detents into it while a render is in
+// flight — fast turning otherwise stepped focus out from the transiently
+// wrong focus position before the load landed. -1 = idle. The timestamp
+// expires a stale pending target (see the clamp) so a render that never
+// fires can't wedge encoder nav.
+static int      s_pager_chat_focus_i  = -1;
+static uint32_t s_pager_chat_focus_ms = 0;
+#endif
+
 static void chatVirtReset(LvChatPanel* p) {
   chatVirtCancelRenderTimer();
   (void)p;
+#if defined(TLORA_PAGER)
+  s_pager_chat_focus_i = -1;
+#endif
   // Null the divider pointer WITHOUT queueing a delete. It is always a child of
   // p->msgs, and every path that follows a reset (lv_obj_clean in the empty-thread
   // branches, chatVirtPurgeMsgsChildrenSync, chatVirtClearBubbleWidgets) deletes
@@ -30019,6 +30061,22 @@ static void chatVirtRenderWindow(LvChatPanel* p, lv_coord_t scroll_y, lv_coord_t
     chatVirtLogScrollTransition(p, old_i0, old_i1, i0, i1);
 #endif
 
+#if defined(TLORA_PAGER)
+  // Capture where encoder focus should land after the rebuild BEFORE the clear
+  // deletes the focused row (see s_pager_chat_focus_i above). An explicit
+  // pending target from the encoder clamp wins; otherwise preserve the row
+  // that has focus right now (covers renders the encoder didn't cause, e.g. an
+  // incoming message re-render yanking focus off the list mid-read).
+  int refocus_i = s_pager_chat_focus_i;
+  if (refocus_i < 0 && s_nav_group) {
+    lv_obj_t* foc = lv_group_get_focused(s_nav_group);
+    if (foc && lv_obj_get_parent(foc) == p->msgs) {
+      const intptr_t ud = reinterpret_cast<intptr_t>(lv_obj_get_user_data(foc));
+      if (ud >= 0) refocus_i = (int)ud;   // rows carry their logical index; dividers are negative
+    }
+  }
+#endif
+
   const lv_coord_t saved_scroll_y = scroll_y;
   chatVirtClearBubbleWidgets(p);
   chatVirtEnsureSpacer(p, s_chat_virt.lv_total_h);
@@ -30046,6 +30104,41 @@ static void chatVirtRenderWindow(LvChatPanel* p, lv_coord_t scroll_y, lv_coord_t
   lv_obj_scroll_to_y(p->msgs, saved_scroll_y, LV_ANIM_OFF);
   chatVirtSyncBubblePositions(p);
   CHAT_SCROLL_TRACE_DO(chatVirtCheckStoreEdges(p));
+
+#if defined(TLORA_PAGER)
+  // Re-aim focus at the recreated row for the captured/pending logical index
+  // (clamped into the freshly materialized window — a fast multi-detent target
+  // can briefly run past it; landing on the window edge keeps the traversal
+  // moving and the next render catches up). Uses the one-shot
+  // s_nav_focus_hint: the recreated rows change the nav tree signature, so
+  // navMaybeRebuild fires on the next pump and consumes the hint — same
+  // mechanism settings toggles use to hold focus across their own rebuilds.
+  if (refocus_i >= 0) {
+    if (refocus_i < i0) refocus_i = i0;
+    if (refocus_i > i1) refocus_i = i1;
+    const uint32_t nch2 = lv_obj_get_child_cnt(p->msgs);
+    for (uint32_t c = 0; c < nch2; c++) {
+      lv_obj_t* row = lv_obj_get_child(p->msgs, c);
+      if (!row || !lv_obj_has_flag(row, LV_OBJ_FLAG_CLICKABLE)) continue;
+      if (reinterpret_cast<intptr_t>(lv_obj_get_user_data(row)) == (intptr_t)refocus_i) {
+        s_nav_focus_hint = row;
+        break;
+      }
+    }
+    s_pager_chat_focus_i = -1;   // consumed (whether or not the row was found)
+    // Land the re-aim NOW, not on the next loop-tick nav pump: deleting the
+    // focused row above already made LVGL auto-focus a survivor (the header
+    // gear / a bottom element), and this function runs in an lv_async_call —
+    // LVGL paints right after it returns, so waiting for the pump let that
+    // wrong focus reach the glass for a frame or two (reported: focus visibly
+    // hops out of the list and back on every edge load). A forced synchronous
+    // rebuild consumes the hint before the next paint, so the hop never shows.
+    if (s_nav_focus_hint) {
+      navMarkDirty();
+      navMaybeRebuild();
+    }
+  }
+#endif
 }
 
 static LvChatPanel* s_chat_virt_render_async_panel = nullptr;
@@ -31617,12 +31710,25 @@ static void updatePagerBackspaceHold(unsigned long now) {
 }
 
 // Orange/Alt key, tapped alone (not held as a symbol-layer modifier or for the
-// encoder's Alt+turn) = the same "next field" as one rotary NEXT detent. Call
-// once per loop tick while the screen is on; screen-off handling discards any
-// pending tap instead (see loop()'s HAS_PAGER_KEYBOARD branch) so a stray tap
-// picked up while idle-dimmed can't fire the moment the screen wakes.
+// encoder's Alt+turn). In an open chat it takes over the old Backspace role:
+// jump to the latest message (when scrolled up in history) and drop focus in
+// the composer, ready to type — the natural "done reading, reply now" motion,
+// and the deliberate way OUT of the message list now that plain encoder turns
+// hold focus inside it while history loads (pagerEncoderChatEdgeScroll).
+// Everywhere else it stays the same "next field" as one rotary NEXT detent.
+// Call once per loop tick while the screen is on; screen-off handling discards
+// any pending tap instead (see loop()'s HAS_PAGER_KEYBOARD branch) so a stray
+// tap picked up while idle-dimmed can't fire the moment the screen wakes.
 static void updatePagerAltTapNext() {
   if (!pagerKeyboardConsumeAltTap()) return;
+  LvChatPanel* cp = navOpenChatPanel();
+  if (cp && cp->msgs && cp->composer_ta && lv_obj_is_valid(cp->composer_ta)) {
+    if (chatVirtAwayFromBottom(cp)) chatVirtJumpToLatest(cp);
+    lv_group_focus_obj(cp->composer_ta);
+    s_nav_show = true;
+    if (g_lv.task) g_lv.task->noteUserInput();
+    return;
+  }
   navPushTap(LV_KEY_NEXT);
   if (g_lv.task) g_lv.task->noteUserInput();
 }
@@ -31796,6 +31902,145 @@ static void updatePagerKbBacklight(unsigned long now) {
 // KEYPAD indev already drains (tanmatsuKeypadRead), and a click is ENTER
 // (short) or ESC (long), exactly as specced. 1000 ms long-press threshold
 // matches the existing MomentaryButton convention used elsewhere (PIN_USER_BTN).
+// Plain-turn clamp for the open chat's virtualized message list. The focus
+// group only ever mirrors the MATERIALIZED bubbles (navMaybeRebuild re-collects
+// on every window change), and materializing more history is scroll-driven —
+// so a turn on the edge bubble stepped focus clean out of the list (header
+// actions above, composer below) even with plenty of un-loaded history in that
+// direction. When that's about to happen and more messages exist, free-scroll
+// the list instead (same navScrollFocused the Alt+turn branch uses): the
+// scroll fires the virtualization render, the neighbor bubble joins the nav
+// group via the tree-signature rebuild, and the next detent walks onto it.
+// Focus only leaves the list at the TRUE oldest/newest message. The orange-key
+// solo tap (updatePagerAltTapNext) pushes LV_KEY_NEXT directly and never comes
+// through here, so it stays the deliberate "leave the messages now" exit.
+// Returns true when the detent was consumed as a scroll.
+static bool pagerEncoderChatEdgeScroll(bool up) {
+  LvChatPanel* cp = navOpenChatPanel();
+  if (!cp || !cp->msgs || s_chat_virt.panel != cp || s_chat_virt.n <= 0) return false;
+  // A scroll-load from a previous detent is still in flight (render + focus
+  // re-aim haven't landed yet). Focus may transiently sit OFF the list — the
+  // clear deletes the focused row and LVGL hands focus to a survivor — so a
+  // group step now is exactly the escape this clamp exists to prevent. Fold
+  // the detent into the pending target instead: fast turning accumulates
+  // steps, and the render's re-aim lands focus on the accumulated message.
+  // The timestamp expires a stale target so a render that never fires (e.g.
+  // the scroll had no room) can't permanently swallow encoder nav.
+  if (s_pager_chat_focus_i >= 0) {
+    if (millis() - s_pager_chat_focus_ms > 600) {
+      s_pager_chat_focus_i = -1;   // stale — fall through to normal handling
+    } else {
+      int t = s_pager_chat_focus_i + (up ? -1 : +1);
+      if (t < 0) t = 0;
+      if (t > s_chat_virt.n - 1) t = s_chat_virt.n - 1;
+      s_pager_chat_focus_i  = t;
+      s_pager_chat_focus_ms = millis();
+      navScrollFocused(up);   // keep driving the load toward the target
+      return true;
+    }
+  }
+  lv_obj_t* foc = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
+  if (!foc || lv_obj_get_parent(foc) != cp->msgs) return false;   // focus isn't on a bubble
+  // Edge test: any other nav-collectable sibling (clickable, visible, not
+  // NAV_SKIP — navCollect's own harvest rule) on the turn side? Then the
+  // normal focus step stays inside the list and no clamp is needed. The virt
+  // spacer is non-clickable, so it never counts.
+  const uint32_t nch = lv_obj_get_child_cnt(cp->msgs);
+  const uint32_t fi  = lv_obj_get_index(foc);
+  const uint32_t lo  = up ? 0 : fi + 1;
+  const uint32_t hi  = up ? fi : nch;
+  for (uint32_t i = lo; i < hi; i++) {
+    lv_obj_t* c = lv_obj_get_child(cp->msgs, i);
+    if (c && lv_obj_has_flag(c, LV_OBJ_FLAG_CLICKABLE) &&
+        !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) && !lv_obj_has_flag(c, NAV_SKIP_FLAG))
+      return false;
+  }
+  // On the edge bubble — anything more to load that way? Window-edge indices
+  // catch un-materialized history; the scroll-room checks catch a viewport
+  // that still has materialized-but-off-glass content.
+  const bool more = up
+      ? (s_chat_virt.last_i0 > 0 || lv_obj_get_scroll_y(cp->msgs) > 0)
+      : (s_chat_virt.last_i1 < s_chat_virt.n - 1 || chatVirtAwayFromBottom(cp));
+  if (!more) return false;   // true end of history — let focus leave the list
+  // Aim the post-render focus at the NEIGHBOR the user is turning toward (the
+  // row objects are about to be deleted/recreated, so an object pointer would
+  // dangle — the logical index survives the rebuild).
+  {
+    const intptr_t ud = reinterpret_cast<intptr_t>(lv_obj_get_user_data(foc));
+    int t = (ud >= 0 ? (int)ud : (up ? s_chat_virt.last_i0 : s_chat_virt.last_i1)) + (up ? -1 : +1);
+    if (t < 0) t = 0;
+    if (t > s_chat_virt.n - 1) t = s_chat_virt.n - 1;
+    s_pager_chat_focus_i  = t;
+    s_pager_chat_focus_ms = millis();
+  }
+  navScrollFocused(up);      // animated scroll → virtualization materializes the neighbor
+  return true;
+}
+
+// Bottom-most (newest) materialized bubble row — the natural "re-enter the
+// message list" landing spot for the composer-boundary overrides below.
+static lv_obj_t* pagerChatBottomBubble(LvChatPanel* cp) {
+  lv_obj_t* best = nullptr; intptr_t best_i = -1;
+  const uint32_t n = lv_obj_get_child_cnt(cp->msgs);
+  for (uint32_t i = 0; i < n; i++) {
+    lv_obj_t* c = lv_obj_get_child(cp->msgs, i);
+    if (!c || !lv_obj_has_flag(c, LV_OBJ_FLAG_CLICKABLE) || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN)) continue;
+    const intptr_t ud = reinterpret_cast<intptr_t>(lv_obj_get_user_data(c));
+    if (ud >= 0 && ud > best_i) { best_i = ud; best = c; }   // rows carry their logical index
+  }
+  return best;
+}
+
+// Composer-cluster boundary overrides for the plain encoder turn. The chat's
+// focus ring should read: bubbles → quick-reply △ → emoji → textarea → send →
+// top-bar items — LVGL's group order already walks the interior of the
+// cluster correctly (creation order: △, emoji, textarea, send), so only the
+// two EDGES are overridden: NEXT off the send button (which otherwise WRAPS
+// to the top-most loaded bubble, yanking the view to the top of the window)
+// hops to the top-bar items, and PREV off the △ chip lands on the NEWEST
+// bubble explicitly. "Edge" is detected structurally — no other collectable
+// (clickable/visible/non-NAV_SKIP) composer_row sibling beyond the focused
+// one in the turn direction — NOT by index-vs-textarea, which lumped the
+// emoji chip in with the △ and skipped it entirely on the way out (reported:
+// emoji → PREV jumped straight into the bubbles instead of the △).
+// The chips/send are makeChatDetail() locals, hence the structural detection.
+// Returns true when the detent was consumed by an explicit focus.
+static bool pagerChatComposerNav(bool up) {
+  LvChatPanel* cp = navOpenChatPanel();
+  if (!cp || !cp->composer_row || !cp->composer_ta || !cp->msgs) return false;
+  lv_obj_t* foc = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
+  if (!foc || lv_obj_get_parent(foc) != cp->composer_row) return false;
+  // Edge test: any other collectable sibling on the turn side keeps the step
+  // inside the cluster (the natural group order handles it).
+  const uint32_t nch = lv_obj_get_child_cnt(cp->composer_row);
+  const uint32_t fi  = lv_obj_get_index(foc);
+  const uint32_t lo  = up ? 0 : fi + 1;
+  const uint32_t hi  = up ? fi : nch;
+  for (uint32_t i = lo; i < hi; i++) {
+    lv_obj_t* c = lv_obj_get_child(cp->composer_row, i);
+    if (c && lv_obj_has_flag(c, LV_OBJ_FLAG_CLICKABLE) &&
+        !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) && !lv_obj_has_flag(c, NAV_SKIP_FLAG))
+      return false;
+  }
+  if (!up) {
+    // Send (→, the cluster's right edge) + NEXT: hop to the top-bar items
+    // (the channel-settings gear). DM chats collect no bar items, so settle
+    // on the newest bubble instead of the default wrap-to-top.
+    if (g_statusbar.chan_gear && lv_obj_is_valid(g_statusbar.chan_gear) &&
+        !lv_obj_has_flag(g_statusbar.chan_gear, LV_OBJ_FLAG_HIDDEN)) {
+      s_nav_show = true;
+      lv_group_focus_obj(g_statusbar.chan_gear);
+      return true;
+    }
+    if (lv_obj_t* b = pagerChatBottomBubble(cp)) { s_nav_show = true; lv_group_focus_obj(b); return true; }
+    return false;
+  }
+  // Quick-reply △ (the cluster's left edge) + PREV: straight into the message
+  // list at its newest visible bubble.
+  if (lv_obj_t* b = pagerChatBottomBubble(cp)) { s_nav_show = true; lv_group_focus_obj(b); return true; }
+  return false;
+}
+
 static void updatePagerEncoder(unsigned long now) {
   int delta = pagerEncoderReadDelta();
   const bool held = pagerEncoderClickHeld();
@@ -31899,8 +32144,13 @@ static void updatePagerEncoder(unsigned long now) {
       if (container) navRefocusFirstVisible(container);
     }
   } else {
-    for (; delta > 0; delta--) navPushTap(LV_KEY_NEXT);
-    for (; delta < 0; delta++) navPushTap(LV_KEY_PREV);
+    // Plain turn: one focus step per detent — except in a chat, where two
+    // overrides shape the ring: the composer-cluster boundaries hop to the
+    // top-bar items / back into the bubbles (pagerChatComposerNav), and the
+    // edge bubble of a still-loading history scrolls the list instead of
+    // stepping focus out (pagerEncoderChatEdgeScroll).
+    for (; delta > 0; delta--) { if (!pagerChatComposerNav(false) && !pagerEncoderChatEdgeScroll(false)) navPushTap(LV_KEY_NEXT); }
+    for (; delta < 0; delta++) { if (!pagerChatComposerNav(true)  && !pagerEncoderChatEdgeScroll(true))  navPushTap(LV_KEY_PREV); }
   }
 
   static constexpr uint32_t kLongPressMs = 1000;
@@ -33272,26 +33522,34 @@ if (g_lv.task && g_lv.task->isManualLock()) {
       if (g_lv.task) g_lv.task->noteUserInput();
       return;
     }
-    // Jump to latest: this board has no touch to tap the floating "scroll to
-    // bottom" circle (LvChatPanel::jump_btn) that appears once you've
-    // scrolled up in a chat, so a plain Backspace tap does the same jump +
-    // hide the T-Deck's own jumpToLatestCb() does on click (mirrors the
-    // Tanmatsu F6 hardware-key handler above, plus the hide step that one is
-    // missing). Only intercepted while the button is actually showing, so a
-    // Backspace tap at the bottom of the chat (or outside a chat) still falls
-    // through to its normal no-op / hold-to-back behavior below. Also moves
-    // nav focus to the composer -- without touch, nav focus was left sitting
-    // on whichever message bubble was focused pre-jump, so typing a reply
-    // right after catching up meant first navigating there manually.
+    // Backspace tap in a chat = jump to the first NEW message (the one right
+    // below the "NEW ----" unread divider) and focus it, so the user reads the
+    // new messages chronologically with plain encoder turns from there; with
+    // no divider (nothing unread) it jumps to the NEWEST message instead.
+    // (The old Backspace role -- jump to latest + focus the composer -- moved
+    // to the solo orange/Alt tap, see updatePagerAltTapNext().) The divider
+    // jump reuses the exact scroll recipe refreshChatDetail's open-to-divider
+    // path uses; both cases use the pending-focus re-aim so the recreated row
+    // for the target message ends up focused after the virtualization render.
+    // Outside a chat, Backspace keeps its normal no-op / hold-to-back
+    // behavior below.
     if (key == 0x08) {
       LvChatPanel* cp = navOpenChatPanel();
-      if (cp && cp->msgs && cp->jump_btn && !lv_obj_has_flag(cp->jump_btn, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_scroll_to_y(cp->msgs, LV_COORD_MAX, LV_ANIM_ON);
-        lv_obj_add_flag(cp->jump_btn, LV_OBJ_FLAG_HIDDEN);
-        if (cp->composer_ta && lv_obj_is_valid(cp->composer_ta)) {
-          lv_group_focus_obj(cp->composer_ta);
-          s_nav_show = true;
+      if (cp && cp->msgs && s_chat_virt.panel == cp && s_chat_virt.n > 0) {
+        if (s_chat_virt.divider_i >= 0 && s_chat_virt.divider_y >= 0) {
+          const int32_t virt = (s_chat_virt.divider_y > 8) ? (s_chat_virt.divider_y - 8) : 0;
+          chatVirtResetInputForMsgs(cp);
+          chatVirtCancelRenderTimer();
+          s_chat_virt.last_i0 = -1;   // force the reflow, same as chatVirtJumpToLatest
+          s_chat_virt.last_i1 = -1;
+          chatVirtQueueScroll(cp, chatVirtVirtToLv(virt));
+          chatUpdateJumpButtons(cp);
+          s_pager_chat_focus_i = s_chat_virt.divider_i;   // land focus on the first NEW message
+        } else {
+          chatVirtJumpToLatest(cp);                       // nothing unread -> newest message
+          s_pager_chat_focus_i = s_chat_virt.n - 1;
         }
+        s_pager_chat_focus_ms = millis();
         if (g_lv.task) g_lv.task->noteUserInput();
         return;
       }
