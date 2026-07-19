@@ -120,6 +120,9 @@
   #if defined(HAS_PAGER_ENCODER)
     #include <helpers/input/PagerEncoder.h>
   #endif
+  #if defined(HAS_ATTAKY_MESH_KEYBOARD)
+    #include <AttakyMeshSeriesKeyboard.h>
+  #endif
   #include "KeyboardLayouts.h"
   #include "i18n.h"
   #include "emoji_data.h"     // baked Noto colour-emoji glyphs (emojiGlyphLookup)
@@ -41870,6 +41873,10 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     // must match so LVGL renders the full 320x240 landscape surface.
     s_ui_rotation = LV_DISP_ROT_270;
 #endif
+#if defined(ATTAKY_MESH_SERIES)
+    // Display and touch share this landscape transform.
+    s_ui_rotation = LV_DISP_ROT_90;
+#endif
 #if !defined(HAS_TANMATSU)
     // REMOTE mode: render the UI to a virtual 480x800 PORTRAIT display for the web
     // (headless/browser use). No physical-panel rotation — the panel is a placeholder.
@@ -43954,6 +43961,20 @@ void UITask::loop() {
   }
   serviceLockscreen();
   serviceLockingCountdown(now);
+#endif
+#if defined(HAS_ATTAKY_MESH_KEYBOARD)
+  {
+    lv_obj_t* akb_ta = g_lv.keyboard ? lv_keyboard_get_textarea(g_lv.keyboard) : nullptr;
+    attakyKeyboardPoll(akb_ta != nullptr);
+    for (int kbi = 0; akb_ta && kbi < 16; ++kbi) {
+      int key = attakyKeyboardReadKey();
+      if (key <= 0) break;
+      if (!_screen_off) noteUserInput();
+      if (key == 0x0D || key == 0x0A)      lv_event_send(g_lv.keyboard, LV_EVENT_READY, nullptr);
+      else if (key == 0x08 || key == 0x7F) lv_textarea_del_char(akb_ta);
+      else if (key >= 0x20)                lv_textarea_add_char(akb_ta, (uint32_t)key);
+    }
+  }
 #endif
 #if !defined(HAS_TANMATSU)
   // While a web-mirror browser is connected, count it as activity so the device screen
